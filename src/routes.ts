@@ -1,11 +1,18 @@
 import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
-import { submitTransaction } from './abstraction';
+import { submitTransaction, submitUniversalTransaction } from './abstraction';
 import { 
   RateLimiter,
   CircuitBreaker
 } from './utils';
 import { ethers } from 'ethers';
+import { CHAINS } from './abstraction';
+import { privateKeyToAccount } from "viem/accounts";
+import { 
+  createPublicClient, 
+  http
+} from "viem";
+import { toSafeSmartAccount } from 'permissionless/accounts';
 
 const router = Router();
 
@@ -218,6 +225,280 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       timestamp: new Date().toISOString(),
     } as any);
   }
+});
+
+// ==================== UNIVERSAL TRANSACTION ENDPOINT ====================
+
+// Universal transaction interface
+interface UniversalTransactionBody {
+  chainId: number;
+  calls: Array<{
+    to: string;
+    value?: string;
+    data?: string;
+    abi?: any[];
+    functionName?: string;
+    args?: any[];
+  }>;
+  ownerPrivateKey: string;
+  ownerAddress: string;
+  rpcUrl: string;
+  paymasterToken?: string; // Optional: token address to pay gas with
+}
+
+router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
+  transactionHash?: string;
+  userOperationHash?: string;
+  chainId: number;
+  gasUsed?: string;
+}>) => {
+  try {
+    const {
+      chainId,
+      calls,
+      ownerPrivateKey,
+      ownerAddress,
+      rpcUrl,
+      paymasterToken
+    } = req.body as UniversalTransactionBody;
+
+    // Validate required fields
+    if (!chainId || !calls || !Array.isArray(calls) || calls.length === 0 || !ownerPrivateKey || !ownerAddress || !rpcUrl) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Validate owner address
+    if (!ethers.utils.isAddress(ownerAddress)) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid owner address format',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Validate each call
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      
+      if (!call || !call.to || !ethers.utils.isAddress(call.to)) {
+        res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: `Invalid 'to' address in call ${i}`,
+          timestamp: new Date().toISOString(),
+        } as any);
+        return;
+      }
+
+      // Validate value if provided
+      if (call && call.value !== undefined) {
+        try {
+          BigInt(call.value);
+        } catch (error) {
+          res.status(400).json({
+            success: false,
+            error: 'Validation Error',
+            message: `Invalid 'value' format in call ${i}. Must be a valid number string.`,
+            timestamp: new Date().toISOString(),
+          } as any);
+          return;
+        }
+      }
+
+      // Validate that call has either data, or abi+functionName+args, or is a simple value transfer
+      const hasData = !!(call && call.data);
+      const hasAbiCall = !!(call && call.abi && call.functionName);
+      const hasValue = !!(call && call.value && call.value !== '0');
+
+      if (!hasData && !hasAbiCall && !hasValue) {
+        res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: `Call ${i} must have either 'data', or 'abi'+'functionName'+'args', or 'value' > 0`,
+          timestamp: new Date().toISOString(),
+        } as any);
+        return;
+      }
+    }
+
+    // Validate paymaster token if provided
+    if (paymasterToken && !ethers.utils.isAddress(paymasterToken)) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid paymaster token address format',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Verify owner address matches private key
+    try {
+      const wallet = new ethers.Wallet(ownerPrivateKey);
+      if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+        res.status(400).json({
+          success: false,
+          error: 'Authentication Error',
+          message: 'Private key does not match owner address',
+          timestamp: new Date().toISOString(),
+        } as any);
+        return;
+      }
+    } catch (error) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid private key format',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Get bundler and paymaster URLs based on chainId
+    let bundlerUrl: string;
+    let paymasterRPC: string;
+
+    if (chainId === 8453) { // Base
+      bundlerUrl = process.env.BASE_BUNDLER_URL!;
+      paymasterRPC = process.env.BASE_PAYMASTER_RPC!;
+    } else if (chainId === 137) { // Polygon
+      bundlerUrl = process.env.POLYGON_BUNDLER_URL!;
+      paymasterRPC = process.env.POLYGON_PAYMASTER_RPC!;
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    if (!bundlerUrl || !paymasterRPC) {
+      res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing environment variables for chain ${chainId}. Check BASE_BUNDLER_URL/BASE_PAYMASTER_RPC or POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    console.log(`🚀 Processing universal transaction on chain ${chainId}:`, {
+      callsCount: calls.length,
+      ownerAddress,
+      rpcUrl,
+      bundlerUrl,
+      paymasterRPC,
+      paymasterToken: paymasterToken || 'sponsored gas'
+    });
+
+    console.log(`⚡ Gas will be ${paymasterToken ? `paid with ${paymasterToken} tokens via ERC-20 paymaster` : 'sponsored by paymaster'}`);
+
+    // Execute universal transaction with circuit breaker
+    const result = await paymasterCircuitBreaker.execute(() =>
+      submitUniversalTransaction(
+        chainId,
+        rpcUrl,
+        calls,
+        ownerPrivateKey,
+        bundlerUrl,
+        paymasterRPC,
+        paymasterToken
+      )
+    );
+
+    if (result.success) {
+      res.json({
+        success: true,
+        data: {
+          ...(result.transactionHash ? { transactionHash: result.transactionHash } : {}),
+          ...(result.userOperationHash ? { userOperationHash: result.userOperationHash } : {}),
+          chainId
+        },
+        message: `Universal transaction completed successfully on chain ${chainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'Transaction Failed',
+        message: result.error || 'Universal transaction failed',
+        timestamp: new Date().toISOString(),
+      } as any);
+    }
+
+  } catch (error: any) {
+    console.error('Universal transaction error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to process universal transaction',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
+
+
+router.post('/api/sign',  async (req, res) => {
+  const {privateKey, chainId, rpcUrl} = req.body;
+
+  try{
+    const chain = CHAINS[chainId as keyof typeof CHAINS];
+    if (!chain) {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+     // Create clients
+     const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain
+    });
+
+    // Chain validation is handled in the universal transaction function
+
+    // Create signer from private key
+    const signer = privateKeyToAccount(privateKey as `0x${string}`);
+    console.log(`👤 Owner address: ${signer.address}`);
+     // Create Safe smart account
+     const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [signer],
+      version: "1.4.1"
+    });
+
+    console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
+
+
+    
+
+
+
+  }
+  catch(error: any){
+    console.error('Sign error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to process sign',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+  
 });
 
 // System status endpoint for monitoring

@@ -21,7 +21,7 @@ import { base, polygon } from "viem/chains";
 // Environment variables loaded via import "dotenv/config"
 
 // Chain configurations
-const CHAINS = {
+export const CHAINS = {
   8453: base,
   137: polygon
 };
@@ -232,6 +232,225 @@ export const submitTransaction = async (
     return {
       success: false,
       error: error?.message || "Unknown error during smart account transaction"
+    };
+  }
+};
+
+/**
+ * Submit any transaction using Pimlico smart account with gas sponsorship
+ * @param chainId - Chain ID (e.g., 8453 for Base, 137 for Polygon)
+ * @param rpcNodeProvider - RPC URL for the chain
+ * @param calls - Array of transaction calls to execute
+ * @param ownerPrivateKey - Owner's private key for signing
+ * @param bundlerUrl - Pimlico bundler URL
+ * @param paymasterRPC - Pimlico paymaster URL
+ * @param paymasterToken - Token address to pay gas with (optional, uses ETH if not provided)
+ * @returns Transaction result
+ */
+export const submitUniversalTransaction = async (
+  chainId: number,
+  rpcNodeProvider: string,
+  calls: Array<{
+    to: string;
+    value?: string;
+    data?: string;
+    abi?: any[];
+    functionName?: string;
+    args?: any[];
+  }>,
+  ownerPrivateKey: string,
+  bundlerUrl: string,
+  paymasterRPC: string,
+  paymasterToken?: string
+): Promise<{
+  success: boolean;
+  transactionHash?: string;
+  error?: string;
+  userOperationHash?: string;
+}> => {
+  try {
+    console.log(`🚀 Starting Pimlico smart account universal transaction with gas sponsorship...`);
+    console.log(`📝 Parameters:`, {
+      chainId,
+      calls: calls.map(call => ({
+        to: call.to,
+        value: call.value || '0',
+        functionName: call.functionName || 'raw',
+        hasData: !!call.data
+      })),
+      rpcNodeProvider,
+      bundlerUrl,
+      paymasterRPC,
+      paymasterToken
+    });
+
+    // Get chain config
+    const chain = CHAINS[chainId as keyof typeof CHAINS];
+    if (!chain) {
+      return {
+        success: false,
+        error: `Unsupported chain ID: ${chainId}`
+      };
+    }
+
+    // Create clients
+    const publicClient = createPublicClient({
+      transport: http(rpcNodeProvider),
+      chain
+    });
+
+    const pimlicoClient = createPimlicoClient({
+      chain,
+      transport: http(bundlerUrl),
+      entryPoint: {
+        address: entryPoint07Address,
+        version: "0.7" as EntryPointVersion,
+      },
+    });
+
+    // Create signer from private key
+    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    console.log(`👤 Owner address: ${signer.address}`);
+
+    // Create Safe smart account
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [signer],
+      version: "1.4.1"
+    });
+
+    console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
+
+    // Check smart account deployment status
+    const accountCode = await publicClient.getBytecode({ address: smartAccount.address });
+    const isDeployed = accountCode && accountCode !== '0x';
+    
+    console.log(`🏦 Smart account deployment status:`, {
+      address: smartAccount.address,
+      isDeployed,
+      codeLength: accountCode?.length || 0
+    });
+
+    // Check account balance (native token)
+    const accountBalance = await publicClient.getBalance({ address: smartAccount.address });
+    console.log(`🔍 Smart account details:`, {
+      nativeBalance: ethers.utils.formatEther(accountBalance.toString()),
+      hasCode: isDeployed
+    });
+
+    // Prepare transaction calls
+    const transactionCalls = calls.map(call => {
+      if (call.abi && call.functionName && call.args) {
+        // ABI-based call
+        return {
+          to: getAddress(call.to),
+          value: call.value ? BigInt(call.value) : BigInt(0),
+          abi: call.abi,
+          functionName: call.functionName,
+          args: call.args,
+        };
+      } else if (call.data) {
+        // Raw data call
+        return {
+          to: getAddress(call.to),
+          value: call.value ? BigInt(call.value) : BigInt(0),
+          data: call.data as `0x${string}`,
+        };
+      } else {
+        // Simple value transfer
+        return {
+          to: getAddress(call.to),
+          value: call.value ? BigInt(call.value) : BigInt(0),
+        };
+      }
+    });
+
+    console.log(`🔧 Prepared ${transactionCalls.length} transaction calls`);
+
+    // Create smart account client
+    let smartAccountClient;
+    let paymasterContext = {};
+
+    if (paymasterToken) {
+      // ERC-20 paymaster (user pays gas in tokens)
+      console.log(`💰 Getting token quotes for ERC-20 paymaster with token: ${paymasterToken}...`);
+      
+      const quotes = await pimlicoClient.getTokenQuotes({
+        chain,
+        tokens: [paymasterToken as Address]
+      });
+      
+      if (!quotes || quotes.length === 0) {
+        return {
+          success: false,
+          error: `Token ${paymasterToken} not supported by ERC-20 paymaster`
+        };
+      }
+      
+      const paymaster = quotes[0]?.paymaster;
+      if (!paymaster) {
+        return {
+          success: false,
+          error: `No paymaster available for token ${paymasterToken}`
+        };
+      }
+      
+      console.log(`💳 Using ERC-20 paymaster: ${paymaster}`);
+      paymasterContext = { token: paymasterToken as Address };
+
+      // Add token approval call if using ERC-20 paymaster
+      transactionCalls.unshift({
+        to: getAddress(paymasterToken),
+        value: BigInt(0),
+        abi: parseAbi(["function approve(address,uint256)"]) as any,
+        functionName: "approve",
+        args: [paymaster, maxUint256],
+      });
+    } else {
+      // Regular paymaster (sponsored gas)
+      console.log(`💳 Using sponsored gas paymaster`);
+    }
+
+    smartAccountClient = createSmartAccountClient({
+      account: smartAccount,
+      chain,
+      bundlerTransport: http(bundlerUrl),
+      paymaster: pimlicoClient,
+      userOperation: {
+        estimateFeesPerGas: async () => {
+          return (await pimlicoClient.getUserOperationGasPrice()).fast;
+        },
+      },
+    });
+
+    // Send transaction
+    console.log(`🔧 Sending UserOperation with ${paymasterToken ? 'ERC-20' : 'sponsored'} paymaster...`);
+    const userOperationHash = await smartAccountClient.sendTransaction({
+      calls: transactionCalls,
+      ...(paymasterToken ? { paymasterContext } : {})
+    });
+
+    console.log(`📤 UserOperation sent. Hash: ${userOperationHash}`);
+    console.log(`🎉 Universal transaction submitted successfully!`);
+    console.log(`💳 Gas paid with ${paymasterToken ? `${paymasterToken} tokens via ERC-20 paymaster` : 'sponsored gas'} 🔥`);
+    console.log(`🔍 Track transaction status with UserOperation hash: ${userOperationHash}`);
+
+    // Return success immediately after getting UserOperation hash
+    return {
+      success: true,
+      userOperationHash
+    };
+
+  } catch (error: any) {
+    console.error(`❌ Pimlico universal transaction failed:`, {
+      error: error?.message || error,
+      errorType: error?.constructor?.name || "Unknown",
+      stack: error?.stack
+    });
+
+    return {
+      success: false,
+      error: error?.message || "Unknown error during universal transaction"
     };
   }
 };
