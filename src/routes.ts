@@ -501,6 +501,194 @@ router.post('/api/sign',  async (req, res) => {
   
 });
 
+// ==================== SMART ACCOUNT ENDPOINTS ====================
+
+// Get smart account address endpoint
+router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
+  try {
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+
+    // Validate required fields - we need private key to deterministically calculate address
+    if (!chainId || !ownerPrivateKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'chainId and ownerPrivateKey are required',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate chain support
+    const chain = CHAINS[chainId as keyof typeof CHAINS];
+    if (!chain) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate private key format
+    try {
+      const wallet = new ethers.Wallet(ownerPrivateKey);
+      console.log(`👤 Owner address: ${wallet.address}`);
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid private key format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Use provided RPC URL or default
+    const finalRpcUrl = rpcUrl || (chainId === 8453 ? 'https://mainnet.base.org' : 'https://polygon-rpc.com');
+
+    console.log(`🔍 Getting smart account address on chain ${chainId}`);
+
+    // Create public client
+    const publicClient = createPublicClient({
+      transport: http(finalRpcUrl),
+      chain
+    });
+
+    // Create signer from private key
+    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    console.log(`👤 Owner address: ${signer.address}`);
+    
+    // Create Safe smart account to get the deterministic address
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [signer],
+      version: "1.4.1"
+    });
+
+    console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
+
+    res.json({
+      success: true,
+      data: {
+        address: smartAccount.address,
+        chainId: chainId
+      },
+      message: `Smart account address retrieved successfully for chain ${chainId}`,
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error: any) {
+    console.error('Get smart account address error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to get smart account address',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Create smart account endpoint
+router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
+  try {
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+
+    // Validate required fields
+    if (!chainId || !ownerPrivateKey || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'chainId, ownerPrivateKey, and rpcUrl are required',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate chain support
+    const chain = CHAINS[chainId as keyof typeof CHAINS];
+    if (!chain) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate private key format
+    try {
+      const wallet = new ethers.Wallet(ownerPrivateKey);
+      console.log(`👤 Owner address: ${wallet.address}`);
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid private key format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    console.log(`🏗️ Creating smart account on chain ${chainId}`);
+
+    // Create public client
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain
+    });
+
+    // Create signer from private key
+    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    console.log(`👤 Owner address: ${signer.address}`);
+
+    // Create Safe smart account
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [signer],
+      version: "1.4.1"
+    });
+
+    console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
+
+    // Check if smart account is already deployed
+    const accountCode = await publicClient.getBytecode({ address: smartAccount.address });
+    const isDeployed = accountCode && accountCode !== '0x';
+    
+    console.log(`🏦 Smart account deployment status:`, {
+      address: smartAccount.address,
+      isDeployed,
+      codeLength: accountCode?.length || 0
+    });
+
+    let transactionHash: string | undefined;
+
+    if (!isDeployed) {
+      console.log(`🚀 Smart account not deployed yet. It will be deployed on first transaction.`);
+      // Note: Safe smart accounts are deployed lazily on first transaction
+      // We don't need to deploy them explicitly
+    } else {
+      console.log(`✅ Smart account already deployed at ${smartAccount.address}`);
+    }
+
+    res.json({
+      success: true,
+      data: {
+        address: smartAccount.address,
+        chainId: chainId,
+        ...(transactionHash ? { transactionHash } : {})
+      },
+      message: `Smart account ${isDeployed ? 'retrieved' : 'prepared for deployment'} successfully on chain ${chainId}`,
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error: any) {
+    console.error('Create smart account error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to create smart account',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 // System status endpoint for monitoring
 router.get('/api/system/status', (_req, res) => {
   res.json({
