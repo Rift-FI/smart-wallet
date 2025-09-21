@@ -277,4 +277,146 @@ curl -X POST http://localhost:3000/api/transaction \
     "rpcUrl": "https://polygon-rpc.com"
   }
   ```
+
+### Native Token Transfers (ETH, MATIC, etc.) 💰
+
+Send native tokens (ETH, MATIC) gaslessly using ERC-4337 and Pimlico paymasters.
+
+3. **Send 1 MATIC on Polygon** (with sponsored gas):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "calls": [
+      {
+        "to": "0xRecipientAddress",
+        "value": "1000000000000000000"
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourAddress",
+    "rpcUrl": "https://polygon-rpc.com"
+  }'
+```
+
+4. **Send 0.5 ETH on Base** (pay gas with USDC):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 8453,
+    "calls": [
+      {
+        "to": "0xRecipientAddress",
+        "value": "500000000000000000"
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourAddress",
+    "rpcUrl": "https://mainnet.base.org",
+    "paymasterToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+  }'
+```
+
+5. **Batch native transfers** (send to multiple recipients):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "calls": [
+      {
+        "to": "0xRecipient1",
+        "value": "1000000000000000000"
+      },
+      {
+        "to": "0xRecipient2",
+        "value": "2000000000000000000"
+      },
+      {
+        "to": "0xRecipient3",
+        "value": "500000000000000000"
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourAddress",
+    "rpcUrl": "https://polygon-rpc.com"
+  }'
+```
+
+6. **Mixed transaction** (native transfer + token transfer):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "calls": [
+      {
+        "to": "0xRecipient",
+        "value": "1000000000000000000"
+      },
+      {
+        "to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "abi": [
+          {
+            "name": "transfer",
+            "type": "function",
+            "inputs": [
+              {"type": "address", "name": "to"},
+              {"type": "uint256", "name": "amount"}
+            ]
+          }
+        ],
+        "functionName": "transfer",
+        "args": ["0xRecipient", "1000000"]
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourAddress",
+    "rpcUrl": "https://polygon-rpc.com",
+    "paymasterToken": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+  }'
+```
+
+### Smart Account Management 🏦
+
+Get smart account addresses and create accounts deterministically.
+
+7. **Get smart account address**:
+```bash
+curl -X POST http://localhost:3000/api/smart-account/address \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "rpcUrl": "https://polygon-rpc.com"
+  }'
+```
+
+8. **Create smart account**:
+```bash
+curl -X POST http://localhost:3000/api/smart-account/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "rpcUrl": "https://polygon-rpc.com"
+  }'
+```
+
+### Value Conversion Guide 📏
+
+**Wei to Token Conversion:**
+- `1000000000000000000` wei = 1 ETH/MATIC
+- `500000000000000000` wei = 0.5 ETH/MATIC  
+- `100000000000000000` wei = 0.1 ETH/MATIC
+- `10000000000000000` wei = 0.01 ETH/MATIC
+
+**Key Benefits:**
+- ✅ **Gasless for users** - Paymaster sponsors gas fees
+- ✅ **Pay gas with tokens** - Use USDC instead of ETH/MATIC
+- ✅ **Batch transactions** - Multiple transfers in one operation
+- ✅ **Same smart account** - Deterministic address across chains
+- ✅ **Atomic execution** - All calls succeed or all fail
 **Built with ❤️ using ERC-4337, Pimlico, Safe, and TypeScript**
