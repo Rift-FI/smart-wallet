@@ -16,14 +16,15 @@ import {
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
 import { privateKeyToAccount } from "viem/accounts";
-import { base, polygon } from "viem/chains";
+import { base, polygon, celo } from "viem/chains";
 
 // Environment variables loaded via import "dotenv/config"
 
 // Chain configurations
 export const CHAINS = {
   8453: base,
-  137: polygon
+  137: polygon,
+  42220: celo
 };
 
 /**

@@ -47,6 +47,10 @@ BASE_PAYMASTER_RPC=https://api.pimlico.io/v2/base/rpc?apikey=your_pimlico_api_ke
 POLYGON_BUNDLER_URL=https://api.pimlico.io/v1/polygon/rpc?apikey=your_pimlico_api_key_here
 POLYGON_PAYMASTER_RPC=https://api.pimlico.io/v2/polygon/rpc?apikey=your_pimlico_api_key_here
 
+# Celo Chain (Chain ID: 42220)
+CELO_BUNDLER_URL=https://api.pimlico.io/v1/celo/rpc?apikey=your_pimlico_api_key_here
+CELO_PAYMASTER_RPC=https://api.pimlico.io/v2/celo/rpc?apikey=your_pimlico_api_key_here
+
 # Development settings
 NODE_ENV=development
 PORT=3000
@@ -113,6 +117,7 @@ Transfer any ERC-20 token on any supported chain with gas paid in tokens.
 **Currently Configured:**
 - **Base** (Chain ID: 8453) - Coinbase L2
 - **Polygon** (Chain ID: 137) - Polygon PoS
+- **Celo** (Chain ID: 42220) - Celo Mainnet
 
 **Easily Expandable to 100+ Chains:**
 - Ethereum, Arbitrum, Optimism, zkSync Era
@@ -402,6 +407,53 @@ curl -X POST http://localhost:3000/api/smart-account/create \
     "chainId": 137,
     "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
     "rpcUrl": "https://polygon-rpc.com"
+  }'
+```
+
+### Celo USDT Transfer Example 🟡
+
+9. **Transfer USDT on Celo**:
+```bash
+curl -X POST http://localhost:3000/api/transfer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 42220,
+    "tokenAddress": "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+    "recipient": "0xRecipientAddress",
+    "amount": 7.53,
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourEOAAddress",
+    "rpcUrl": "https://forno.celo.org"
+  }'
+```
+
+10. **Universal transaction on Celo** (with USDT for gas):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 42220,
+    "calls": [
+      {
+        "to": "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e",
+        "abi": [
+          {
+            "name": "transfer",
+            "type": "function",
+            "inputs": [
+              {"type": "address", "name": "to"},
+              {"type": "uint256", "name": "amount"}
+            ]
+          }
+        ],
+        "functionName": "transfer",
+        "args": ["0xRecipientAddress", "7530000"]
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourEOAAddress",
+    "rpcUrl": "https://forno.celo.org",
+    "paymasterToken": "0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e"
   }'
 ```
 

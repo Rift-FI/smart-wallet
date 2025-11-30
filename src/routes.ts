@@ -148,11 +148,14 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
     } else if (chainId === 137) { // Polygon
       bundlerUrl = process.env.POLYGON_BUNDLER_URL!;
       paymasterRPC = process.env.POLYGON_PAYMASTER_RPC!;
+    } else if (chainId === 42220) { // Celo
+      bundlerUrl = process.env.CELO_BUNDLER_URL!;
+      paymasterRPC = process.env.CELO_PAYMASTER_RPC!;
     } else {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137), Celo (42220)`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -162,7 +165,7 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check BASE_BUNDLER_URL/BASE_PAYMASTER_RPC or POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check BASE_BUNDLER_URL/BASE_PAYMASTER_RPC, POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC, or CELO_BUNDLER_URL/CELO_PAYMASTER_RPC`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -372,11 +375,14 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
     } else if (chainId === 137) { // Polygon
       bundlerUrl = process.env.POLYGON_BUNDLER_URL!;
       paymasterRPC = process.env.POLYGON_PAYMASTER_RPC!;
+    } else if (chainId === 42220) { // Celo
+      bundlerUrl = process.env.CELO_BUNDLER_URL!;
+      paymasterRPC = process.env.CELO_PAYMASTER_RPC!;
     } else {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137), Celo (42220)`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -386,7 +392,7 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check BASE_BUNDLER_URL/BASE_PAYMASTER_RPC or POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check BASE_BUNDLER_URL/BASE_PAYMASTER_RPC, POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC, or CELO_BUNDLER_URL/CELO_PAYMASTER_RPC`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -457,7 +463,7 @@ router.post('/api/sign',  async (req, res) => {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137), Celo (42220)`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -524,7 +530,7 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137), Celo (42220)`,
         timestamp: new Date().toISOString(),
       });
     }
@@ -543,7 +549,7 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
     }
 
     // Use provided RPC URL or default
-    const finalRpcUrl = rpcUrl || (chainId === 8453 ? 'https://mainnet.base.org' : 'https://polygon-rpc.com');
+    const finalRpcUrl = rpcUrl || (chainId === 8453 ? 'https://mainnet.base.org' : chainId === 42220 ? 'https://forno.celo.org' : 'https://polygon-rpc.com');
 
     console.log(`🔍 Getting smart account address on chain ${chainId}`);
 
@@ -608,7 +614,7 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: Base (8453), Polygon (137), Celo (42220)`,
         timestamp: new Date().toISOString(),
       });
     }
