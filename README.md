@@ -39,6 +39,10 @@ Edit `.env` with your Pimlico API key:
 # Pimlico API Key (get from https://dashboard.pimlico.io)
 PIMLICO_API_KEY=your_pimlico_api_key_here
 
+# Ethereum Mainnet (Chain ID: 1)
+ETHEREUM_BUNDLER_URL=https://api.pimlico.io/v1/ethereum/rpc?apikey=your_pimlico_api_key_here
+ETHEREUM_PAYMASTER_RPC=https://api.pimlico.io/v2/ethereum/rpc?apikey=your_pimlico_api_key_here
+
 # Base Chain (Chain ID: 8453)
 BASE_BUNDLER_URL=https://api.pimlico.io/v1/base/rpc?apikey=your_pimlico_api_key_here
 BASE_PAYMASTER_RPC=https://api.pimlico.io/v2/base/rpc?apikey=your_pimlico_api_key_here
@@ -115,6 +119,7 @@ Transfer any ERC-20 token on any supported chain with gas paid in tokens.
 ## 🌐 Supported Chains
 
 **Currently Configured:**
+- **Ethereum** (Chain ID: 1) - Ethereum Mainnet
 - **Base** (Chain ID: 8453) - Coinbase L2
 - **Polygon** (Chain ID: 137) - Polygon PoS
 - **Celo** (Chain ID: 42220) - Celo Mainnet
@@ -410,9 +415,45 @@ curl -X POST http://localhost:3000/api/smart-account/create \
   }'
 ```
 
+### Ethereum Mainnet USDC Transfer Example 🔷
+
+9. **Transfer USDC on Ethereum Mainnet**:
+```bash
+curl -X POST http://localhost:3000/api/transfer \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 1,
+    "tokenAddress": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "recipient": "0xRecipientAddress",
+    "amount": 10.5,
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourEOAAddress",
+    "rpcUrl": "https://eth.llamarpc.com"
+  }'
+```
+
+10. **Send ETH on Ethereum Mainnet** (pay gas with USDC):
+```bash
+curl -X POST http://localhost:3000/api/transaction \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 1,
+    "calls": [
+      {
+        "to": "0xRecipientAddress",
+        "value": "1000000000000000000"
+      }
+    ],
+    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
+    "ownerAddress": "0xYourEOAAddress",
+    "rpcUrl": "https://eth.llamarpc.com",
+    "paymasterToken": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+  }'
+```
+
 ### Celo USDT Transfer Example 🟡
 
-9. **Transfer USDT on Celo**:
+11. **Transfer USDT on Celo**:
 ```bash
 curl -X POST http://localhost:3000/api/transfer \
   -H "Content-Type: application/json" \
@@ -427,7 +468,7 @@ curl -X POST http://localhost:3000/api/transfer \
   }'
 ```
 
-10. **Universal transaction on Celo** (with USDT for gas):
+12. **Universal transaction on Celo** (with USDT for gas):
 ```bash
 curl -X POST http://localhost:3000/api/transaction \
   -H "Content-Type: application/json" \
