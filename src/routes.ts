@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
+import { pairAndApprove, disconnectSession, getActiveSessions } from './walletconnect';
 import { 
   RateLimiter,
   CircuitBreaker
@@ -937,6 +938,141 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       success: false,
       error: 'Internal Server Error',
       message: error?.message || 'Failed to process bridge',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// ==================== WALLETCONNECT ENDPOINTS ====================
+
+// Pair with a DApp via WalletConnect URI
+router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
+  try {
+    const { uri, ownerPrivateKey, chainId, rpcUrl } = req.body;
+
+    if (!uri || !ownerPrivateKey || !chainId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Required fields: uri, ownerPrivateKey, chainId. Optional: rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate chain
+    const chain = CHAINS[chainId as keyof typeof CHAINS];
+    if (!chain) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate private key
+    try {
+      new ethers.Wallet(ownerPrivateKey);
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid private key format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Resolve RPC, bundler, paymaster
+    const defaultRpcUrls: Record<number, string> = {
+      1: 'https://eth.llamarpc.com',
+      8453: 'https://mainnet.base.org',
+      137: 'https://polygon-rpc.com',
+      42220: 'https://forno.celo.org',
+      42161: 'https://arb1.arbitrum.io/rpc',
+      43114: 'https://api.avax.network/ext/bc/C/rpc',
+      56: 'https://bsc-dataseed.binance.org',
+      80094: 'https://rpc.berachain.com/',
+      1135: 'https://rpc.api.lisk.com',
+    };
+    const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
+
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig || !chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster config for chain ${chainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const result = await pairAndApprove(
+      uri,
+      ownerPrivateKey,
+      chainId,
+      finalRpcUrl,
+      chainConfig.bundlerUrl,
+      chainConfig.paymasterRPC
+    );
+
+    res.json({
+      success: true,
+      data: {
+        topic: result.topic,
+        smartWalletAddress: result.smartWalletAddress,
+        chainId,
+        peerName: result.peerName,
+        peerUrl: result.peerUrl,
+      },
+      message: `Connected to ${result.peerName}. Transactions will be auto-signed via smart wallet.`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('WalletConnect pair error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'WalletConnect Error',
+      message: error?.message || 'Failed to pair with DApp',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// List active WalletConnect sessions
+router.get('/api/walletconnect/sessions', checkRateLimit, async (_req, res) => {
+  try {
+    const activeSessions = await getActiveSessions();
+    res.json({
+      success: true,
+      data: { sessions: activeSessions },
+      message: `${activeSessions.length} active session(s)`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to get sessions',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Disconnect a WalletConnect session
+router.delete('/api/walletconnect/sessions/:topic', checkRateLimit, async (req, res) => {
+  try {
+    const { topic } = req.params;
+    await disconnectSession(topic);
+    res.json({
+      success: true,
+      message: `Session ${topic} disconnected`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to disconnect session',
       timestamp: new Date().toISOString(),
     });
   }

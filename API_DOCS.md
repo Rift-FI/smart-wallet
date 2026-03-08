@@ -326,7 +326,111 @@ POST /api/smart-account/create
 
 ---
 
-### 7. System Status
+### 7. WalletConnect — Pair with a DApp
+
+Connect to any WalletConnect-compatible DApp (Uniswap, OpenSea, Aave, etc.). The API acts as a server-side wallet — it auto-signs all transactions from the DApp through the smart wallet. No browser extension needed.
+
+```
+POST /api/walletconnect/pair
+```
+
+**Payload:**
+```json
+{
+  "uri": "wc:a1b2c3d4...@2?relay-protocol=irn&symKey=abc123...",
+  "ownerPrivateKey": "0xYourPrivateKey",
+  "chainId": 8453,
+  "rpcUrl": "https://mainnet.base.org"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `uri` | string | Yes | WalletConnect pairing URI from the DApp (starts with `wc:`) |
+| `ownerPrivateKey` | string | Yes | Private key of the smart wallet owner |
+| `chainId` | number | Yes | Chain ID to operate on |
+| `rpcUrl` | string | No | RPC URL (uses default if omitted) |
+
+**How to get the URI:** In any DApp, click "Connect Wallet" → "WalletConnect" → copy the URI (or scan the QR code to get it).
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "topic": "abc123def456...",
+    "smartWalletAddress": "0xSmartWalletAddress",
+    "chainId": 8453,
+    "peerName": "Uniswap",
+    "peerUrl": "https://app.uniswap.org"
+  },
+  "message": "Connected to Uniswap. Transactions will be auto-signed via smart wallet.",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+**What happens after pairing:**
+- The DApp sees your smart wallet address as the connected wallet
+- When the DApp sends a transaction (swap, approve, mint, etc.), the API automatically executes it through the smart wallet
+- Gas is paid via Pimlico ERC-20 paymaster — no native tokens needed
+- Supported methods: `eth_sendTransaction`, `personal_sign`, `eth_sign`, `eth_signTypedData_v4`, `eth_chainId`, `eth_accounts`
+
+---
+
+### 8. WalletConnect — List Active Sessions
+
+Get all currently active WalletConnect sessions.
+
+```
+GET /api/walletconnect/sessions
+```
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "sessions": [
+      {
+        "topic": "abc123def456...",
+        "smartWalletAddress": "0xSmartWalletAddress",
+        "chainId": 8453,
+        "peerName": "Uniswap",
+        "peerUrl": "https://app.uniswap.org"
+      }
+    ]
+  },
+  "message": "1 active session(s)",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+---
+
+### 9. WalletConnect — Disconnect Session
+
+Disconnect from a DApp session.
+
+```
+DELETE /api/walletconnect/sessions/:topic
+```
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `topic` | string (URL param) | Yes | Session topic from the pair response |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Session abc123def456... disconnected",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+---
+
+### 10. System Status
 
 ```
 GET /api/system/status
@@ -391,3 +495,46 @@ Bridging uses **Across Protocol** under the hood.
 6. **Recipient receives** tokens on the destination chain (typically < 30 seconds for L2→L2)
 
 The bridge fee (usually < 0.1%) is deducted from the amount — you send 100 USDC, receive ~99.94 USDC on the other side. No native tokens needed anywhere in the flow.
+
+---
+
+## How WalletConnect Works
+
+WalletConnect lets users interact with any DApp (Uniswap, OpenSea, Aave, etc.) using their smart wallet — without a browser extension.
+
+**Flow:**
+1. **User opens a DApp** and clicks "Connect Wallet" → "WalletConnect"
+2. **DApp shows a QR code / URI** (starts with `wc:...`)
+3. **Backend calls** `POST /api/walletconnect/pair` with the URI and user's private key
+4. **API pairs with the DApp** and exposes the user's smart wallet address
+5. **DApp sends transactions** (swaps, approvals, mints, etc.)
+6. **API auto-signs and executes** each transaction through the smart wallet via ERC-4337
+7. **Gas is paid** in tokens via Pimlico paymaster — no native tokens needed
+
+**Supported DApp requests:**
+| Method | What it does |
+|--------|-------------|
+| `eth_sendTransaction` | Executes transactions through the smart wallet (swaps, transfers, etc.) |
+| `personal_sign` | Signs messages (login signatures, etc.) |
+| `eth_sign` | Signs raw messages |
+| `eth_signTypedData_v4` | Signs EIP-712 typed data (permits, orders, etc.) |
+| `eth_chainId` | Returns the connected chain ID |
+| `eth_accounts` | Returns the smart wallet address |
+
+**Example integration flow:**
+```
+1. GET WC URI from DApp (user scans QR or copies link)
+
+2. POST /api/walletconnect/pair
+   → Returns: { topic, smartWalletAddress, peerName }
+
+3. DApp is now connected. User interacts with DApp normally.
+   → API handles all signing/transactions automatically.
+
+4. When done: DELETE /api/walletconnect/sessions/:topic
+```
+
+**Important notes:**
+- Sessions persist as long as the server is running
+- Each session is bound to one chain — if the DApp requests a chain switch, it's acknowledged but the session stays on the original chain
+- The `topic` from the pair response is used to identify and manage the session
