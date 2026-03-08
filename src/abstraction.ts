@@ -89,7 +89,7 @@ export const submitTransaction = async (
 
     const pimlicoClient = createPimlicoClient({
       chain,
-      transport: http(bundlerUrl),
+      transport: http(paymasterRPC),
       entryPoint: {
         address: entryPoint07Address,
         version: "0.7" as EntryPointVersion,
@@ -308,7 +308,7 @@ export const submitUniversalTransaction = async (
 
     const pimlicoClient = createPimlicoClient({
       chain,
-      transport: http(bundlerUrl),
+      transport: http(paymasterRPC),
       entryPoint: {
         address: entryPoint07Address,
         version: "0.7" as EntryPointVersion,
