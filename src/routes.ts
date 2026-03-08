@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
+import { getAcrossQuote, buildBridgeCalls } from './bridge';
 import { 
   RateLimiter,
   CircuitBreaker
@@ -710,6 +711,232 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       success: false,
       error: 'Internal Server Error',
       message: error?.message || 'Failed to create smart account',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// ==================== BRIDGE ENDPOINT ====================
+
+interface BridgeBody {
+  sourceChainId: number;
+  destChainId: number;
+  tokenAddress: string;
+  amount: number;
+  ownerPrivateKey: string;
+  rpcUrl: string;
+  recipient?: string; // optional, defaults to same smart wallet on dest chain
+}
+
+router.post('/api/bridge', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amount,
+      ownerPrivateKey,
+      rpcUrl,
+      recipient: explicitRecipient
+    } = req.body as BridgeBody;
+
+    // Validate required fields
+    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !ownerPrivateKey || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (sourceChainId === destChainId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Source and destination chains must be different',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (!ethers.utils.isAddress(tokenAddress)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid token address format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Amount must be a positive number',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate source chain support
+    const sourceChain = CHAINS[sourceChainId as keyof typeof CHAINS];
+    if (!sourceChain) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ID ${sourceChainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate private key
+    try {
+      new ethers.Wallet(ownerPrivateKey);
+    } catch (error) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid private key format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Compute smart wallet address
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain: sourceChain
+    });
+
+    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [signer],
+      version: "1.4.1"
+    });
+
+    const smartWalletAddress = smartAccount.address;
+    // Recipient defaults to same smart wallet address (deterministic across chains)
+    const recipient = explicitRecipient && ethers.utils.isAddress(explicitRecipient)
+      ? explicitRecipient
+      : smartWalletAddress;
+
+    console.log(`🌉 Bridge request: ${amount} of ${tokenAddress} from chain ${sourceChainId} → ${destChainId}`);
+    console.log(`🏦 Smart wallet: ${smartWalletAddress}, Recipient: ${recipient}`);
+
+    // Get token decimals
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function decimals() view returns (uint8)'],
+      new ethers.providers.JsonRpcProvider(rpcUrl)
+    );
+    const decimals = await tokenContract.decimals();
+    const amountInWei = ethers.utils.parseUnits(amount.toString(), decimals).toString();
+
+    console.log(`💰 Amount in wei: ${amountInWei} (${decimals} decimals)`);
+
+    // Get quote from Across Protocol
+    console.log(`📊 Fetching Across bridge quote...`);
+    const quote = await getAcrossQuote(
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amountInWei,
+      recipient
+    );
+
+    console.log(`📊 Quote received:`, {
+      outputAmount: quote.outputAmount,
+      outputToken: quote.outputToken.address,
+      totalFee: quote.totalRelayFee.total,
+      spokePool: quote.spokePoolAddress,
+      fillDeadline: quote.fillDeadline,
+    });
+
+    // Build bridge calls (approve SpokePool + depositV3)
+    const bridgeCalls = buildBridgeCalls(
+      quote,
+      smartWalletAddress,
+      recipient,
+      tokenAddress,
+      BigInt(amountInWei),
+      destChainId
+    );
+
+    // Convert to the format submitUniversalTransaction expects
+    const calls = bridgeCalls.map(call => ({
+      to: call.to as string,
+      abi: call.abi as any[],
+      functionName: call.functionName,
+      args: call.args,
+    }));
+
+    // Get bundler/paymaster config for source chain
+    const chainConfig = getChainConfig(sourceChainId);
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ID ${sourceChainId} not configured for bundler/paymaster`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (!chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing ${chainConfig.envPrefix}_BUNDLER_URL or ${chainConfig.envPrefix}_PAYMASTER_RPC`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Execute bridge via smart account with ERC-20 paymaster (gas paid in the bridged token)
+    console.log(`🚀 Executing bridge transaction via smart account...`);
+    const result = await paymasterCircuitBreaker.execute(() =>
+      submitUniversalTransaction(
+        sourceChainId,
+        rpcUrl,
+        calls,
+        ownerPrivateKey,
+        chainConfig.bundlerUrl,
+        chainConfig.paymasterRPC,
+        tokenAddress // pay gas in the token being bridged
+      )
+    );
+
+    if (result.success) {
+      res.json({
+        success: true,
+        data: {
+          ...(result.userOperationHash ? { userOperationHash: result.userOperationHash } : {}),
+          ...(result.transactionHash ? { transactionHash: result.transactionHash } : {}),
+          sourceChainId,
+          destChainId,
+          inputToken: tokenAddress,
+          outputToken: quote.outputToken.address,
+          inputAmount: amount.toString(),
+          outputAmount: ethers.utils.formatUnits(quote.outputAmount, quote.outputToken.decimals),
+          fee: ethers.utils.formatUnits(quote.totalRelayFee.total, decimals),
+          recipient,
+          smartWalletAddress,
+        },
+        message: `Bridge initiated: ${amount} ${quote.inputToken.symbol} from chain ${sourceChainId} → ${quote.outputToken.symbol} on chain ${destChainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'Bridge Failed',
+        message: result.error || 'Bridge transaction failed',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+  } catch (error: any) {
+    console.error('Bridge error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to process bridge',
       timestamp: new Date().toISOString(),
     });
   }
