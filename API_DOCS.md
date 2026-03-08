@@ -328,7 +328,7 @@ POST /api/smart-account/create
 
 ### 7. WalletConnect — Pair with a DApp
 
-Connect to any WalletConnect-compatible DApp (Uniswap, OpenSea, Aave, etc.). The API acts as a server-side wallet — it auto-signs all transactions from the DApp through the smart wallet. No browser extension needed.
+Connect to any WalletConnect-compatible DApp (Uniswap, OpenSea, Aave, etc.). The API acts as a server-side wallet. When the DApp sends a transaction, it is queued as a pending request — the frontend must approve or reject it before it executes.
 
 ```
 POST /api/walletconnect/pair
@@ -364,20 +364,106 @@ POST /api/walletconnect/pair
     "peerName": "Uniswap",
     "peerUrl": "https://app.uniswap.org"
   },
-  "message": "Connected to Uniswap. Transactions will be auto-signed via smart wallet.",
+  "message": "Connected to Uniswap. Transactions require approval via /api/walletconnect/requests/:id/approve",
   "timestamp": "2026-03-08T10:00:00.000Z"
 }
 ```
 
-**What happens after pairing:**
-- The DApp sees your smart wallet address as the connected wallet
-- When the DApp sends a transaction (swap, approve, mint, etc.), the API automatically executes it through the smart wallet
-- Gas is paid via Pimlico ERC-20 paymaster — no native tokens needed
-- Supported methods: `eth_sendTransaction`, `personal_sign`, `eth_sign`, `eth_signTypedData_v4`, `eth_chainId`, `eth_accounts`
+---
+
+### 8. WalletConnect — List Pending Requests
+
+Get all pending DApp requests awaiting user approval. Poll this endpoint to show incoming transaction/sign requests to the user.
+
+```
+GET /api/walletconnect/requests
+```
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "requests": [
+      {
+        "id": 1709901234567,
+        "topic": "abc123def456...",
+        "method": "eth_sendTransaction",
+        "params": [{ "to": "0x...", "data": "0x...", "value": "0x0" }],
+        "peerName": "Uniswap",
+        "chainId": 8453,
+        "smartWalletAddress": "0xSmartWalletAddress",
+        "createdAt": "2026-03-08T10:00:00.000Z"
+      }
+    ]
+  },
+  "message": "1 pending request(s)",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
 
 ---
 
-### 8. WalletConnect — List Active Sessions
+### 9. WalletConnect — Approve Request
+
+Approve a pending request. The transaction is executed through the smart wallet and the result is sent back to the DApp.
+
+```
+POST /api/walletconnect/requests/:id/approve
+```
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | number (URL param) | Yes | Request ID from the pending requests list |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "result": "0xTransactionOrSignatureHash..."
+  },
+  "message": "Request approved and executed",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+**Error Response (404):**
+```json
+{
+  "success": false,
+  "error": "Not Found",
+  "message": "No pending request with id 123456",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+---
+
+### 10. WalletConnect — Reject Request
+
+Reject a pending request. The DApp is notified that the user denied the request.
+
+```
+POST /api/walletconnect/requests/:id/reject
+```
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | number (URL param) | Yes | Request ID from the pending requests list |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Request rejected",
+  "timestamp": "2026-03-08T10:00:00.000Z"
+}
+```
+
+---
+
+### 11. WalletConnect — List Active Sessions
 
 Get all currently active WalletConnect sessions.
 
@@ -407,7 +493,7 @@ GET /api/walletconnect/sessions
 
 ---
 
-### 9. WalletConnect — Disconnect Session
+### 12. WalletConnect — Disconnect Session
 
 Disconnect from a DApp session.
 
@@ -430,7 +516,7 @@ DELETE /api/walletconnect/sessions/:topic
 
 ---
 
-### 10. System Status
+### 13. System Status
 
 ```
 GET /api/system/status
@@ -500,16 +586,20 @@ The bridge fee (usually < 0.1%) is deducted from the amount — you send 100 USD
 
 ## How WalletConnect Works
 
-WalletConnect lets users interact with any DApp (Uniswap, OpenSea, Aave, etc.) using their smart wallet — without a browser extension.
+WalletConnect lets users interact with any DApp (Uniswap, OpenSea, Aave, etc.) using their smart wallet — without a browser extension. All DApp requests require explicit user approval before executing.
 
 **Flow:**
 1. **User opens a DApp** and clicks "Connect Wallet" → "WalletConnect"
 2. **DApp shows a QR code / URI** (starts with `wc:...`)
-3. **Backend calls** `POST /api/walletconnect/pair` with the URI and user's private key
+3. **Frontend calls** `POST /api/walletconnect/pair` with the URI and user's private key
 4. **API pairs with the DApp** and exposes the user's smart wallet address
-5. **DApp sends transactions** (swaps, approvals, mints, etc.)
-6. **API auto-signs and executes** each transaction through the smart wallet via ERC-4337
-7. **Gas is paid** in tokens via Pimlico paymaster — no native tokens needed
+5. **DApp sends a transaction** (swap, approval, mint, etc.)
+6. **API queues the request** as pending — does NOT auto-execute
+7. **Frontend polls** `GET /api/walletconnect/requests` to show the request to the user
+8. **User approves or rejects:**
+   - Approve → `POST /api/walletconnect/requests/:id/approve` → executes through smart wallet
+   - Reject → `POST /api/walletconnect/requests/:id/reject` → DApp gets `USER_REJECTED`
+9. **Gas is paid** in tokens via Pimlico paymaster — no native tokens needed
 
 **Supported DApp requests:**
 | Method | What it does |
@@ -529,12 +619,19 @@ WalletConnect lets users interact with any DApp (Uniswap, OpenSea, Aave, etc.) u
    → Returns: { topic, smartWalletAddress, peerName }
 
 3. DApp is now connected. User interacts with DApp normally.
-   → API handles all signing/transactions automatically.
 
-4. When done: DELETE /api/walletconnect/sessions/:topic
+4. Poll GET /api/walletconnect/requests for incoming requests.
+   → Show each request to the user (method, params, DApp name, chain).
+
+5. User decides:
+   → POST /api/walletconnect/requests/:id/approve  (execute)
+   → POST /api/walletconnect/requests/:id/reject   (deny)
+
+6. When done: DELETE /api/walletconnect/sessions/:topic
 ```
 
 **Important notes:**
 - Sessions persist as long as the server is running
 - Each session is bound to one chain — if the DApp requests a chain switch, it's acknowledged but the session stays on the original chain
 - The `topic` from the pair response is used to identify and manage the session
+- Pending requests that are neither approved nor rejected will remain in the queue until the session is disconnected or the server restarts

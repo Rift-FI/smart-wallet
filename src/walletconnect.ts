@@ -19,7 +19,20 @@ interface SessionConfig {
   paymasterRPC: string;
 }
 
+// Pending request store
+export interface PendingRequest {
+  id: number;
+  topic: string;
+  method: string;
+  params: any[];
+  peerName: string;
+  chainId: number;
+  smartWalletAddress: string;
+  createdAt: string;
+}
+
 const sessions = new Map<string, SessionConfig>();
+const pendingRequests = new Map<number, { pending: PendingRequest; sessionConfig: SessionConfig }>();
 let web3wallet: IWeb3Wallet | null = null;
 
 // Event callbacks for real-time updates
@@ -66,6 +79,7 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
   });
 
   // Handle session requests (DApp sends a transaction/sign request)
+  // Instead of auto-signing, queue as pending for user approval
   web3wallet.on("session_request", async (event) => {
     const { topic, params, id } = event;
     const { request } = params;
@@ -86,29 +100,26 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
       return;
     }
 
-    try {
-      const result = await handleSessionRequest(request.method, request.params, sessionConfig);
-      await web3wallet!.respondSessionRequest({
-        topic,
-        response: {
-          id,
-          jsonrpc: "2.0",
-          result,
-        },
-      });
-      emitEvent({ type: "request_handled", topic, data: { method: request.method, result } });
-    } catch (error: any) {
-      console.error(`❌ WC request failed [${request.method}]:`, error.message);
-      await web3wallet!.respondSessionRequest({
-        topic,
-        response: {
-          id,
-          jsonrpc: "2.0",
-          error: { code: -32000, message: error.message },
-        },
-      });
-      emitEvent({ type: "request_failed", topic, data: { method: request.method, error: error.message } });
-    }
+    // Get peer name from active sessions
+    const activeSessions = web3wallet!.getActiveSessions();
+    const session = activeSessions[topic];
+    const peerName = session?.peer?.metadata?.name || "Unknown DApp";
+
+    // Queue the request for user approval
+    const pending: PendingRequest = {
+      id,
+      topic,
+      method: request.method,
+      params: request.params,
+      peerName,
+      chainId: sessionConfig.chainId,
+      smartWalletAddress: sessionConfig.smartWalletAddress,
+      createdAt: new Date().toISOString(),
+    };
+
+    pendingRequests.set(id, { pending, sessionConfig });
+    console.log(`⏳ Request ${id} queued for approval: ${request.method} from ${peerName}`);
+    emitEvent({ type: "pending_request", topic, data: pending });
   });
 
   // Handle session deletions
@@ -348,4 +359,83 @@ export async function getActiveSessions(): Promise<Array<{
       peerUrl: session.peer?.metadata?.url || "",
     };
   });
+}
+
+/**
+ * Get all pending requests awaiting user approval
+ */
+export function getPendingRequests(): PendingRequest[] {
+  return Array.from(pendingRequests.values()).map(({ pending }) => pending);
+}
+
+/**
+ * Approve a pending request — executes it and responds to the DApp
+ */
+export async function approveRequest(requestId: number): Promise<{
+  success: boolean;
+  result?: any;
+  error?: string;
+}> {
+  const entry = pendingRequests.get(requestId);
+  if (!entry) {
+    return { success: false, error: `No pending request with id ${requestId}` };
+  }
+
+  const { pending, sessionConfig } = entry;
+  const wallet = await getWeb3Wallet();
+
+  try {
+    const result = await handleSessionRequest(pending.method, pending.params, sessionConfig);
+    await wallet.respondSessionRequest({
+      topic: pending.topic,
+      response: {
+        id: pending.id,
+        jsonrpc: "2.0",
+        result,
+      },
+    });
+    pendingRequests.delete(requestId);
+    emitEvent({ type: "request_approved", topic: pending.topic, data: { method: pending.method, result } });
+    console.log(`✅ Request ${requestId} approved and executed: ${pending.method}`);
+    return { success: true, result };
+  } catch (error: any) {
+    await wallet.respondSessionRequest({
+      topic: pending.topic,
+      response: {
+        id: pending.id,
+        jsonrpc: "2.0",
+        error: { code: -32000, message: error.message },
+      },
+    });
+    pendingRequests.delete(requestId);
+    emitEvent({ type: "request_failed", topic: pending.topic, data: { method: pending.method, error: error.message } });
+    console.error(`❌ Request ${requestId} approved but failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Reject a pending request — tells the DApp the user denied it
+ */
+export async function rejectRequest(requestId: number): Promise<void> {
+  const entry = pendingRequests.get(requestId);
+  if (!entry) {
+    throw new Error(`No pending request with id ${requestId}`);
+  }
+
+  const { pending } = entry;
+  const wallet = await getWeb3Wallet();
+
+  await wallet.respondSessionRequest({
+    topic: pending.topic,
+    response: {
+      id: pending.id,
+      jsonrpc: "2.0",
+      error: getSdkError("USER_REJECTED"),
+    },
+  });
+
+  pendingRequests.delete(requestId);
+  emitEvent({ type: "request_rejected", topic: pending.topic, data: { method: pending.method } });
+  console.log(`❌ Request ${requestId} rejected by user: ${pending.method}`);
 }

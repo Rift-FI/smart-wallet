@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
-import { pairAndApprove, disconnectSession, getActiveSessions } from './walletconnect';
+import { pairAndApprove, disconnectSession, getActiveSessions, getPendingRequests, approveRequest, rejectRequest } from './walletconnect';
 import { 
   RateLimiter,
   CircuitBreaker
@@ -1024,7 +1024,7 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
         peerName: result.peerName,
         peerUrl: result.peerUrl,
       },
-      message: `Connected to ${result.peerName}. Transactions will be auto-signed via smart wallet.`,
+      message: `Connected to ${result.peerName}. Transactions require approval via /api/walletconnect/requests/:id/approve`,
       timestamp: new Date().toISOString(),
     });
   } catch (error: any) {
@@ -1073,6 +1073,94 @@ router.delete('/api/walletconnect/sessions/:topic', checkRateLimit, async (req, 
       success: false,
       error: 'Internal Server Error',
       message: error?.message || 'Failed to disconnect session',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Get pending WalletConnect requests awaiting approval
+router.get('/api/walletconnect/requests', checkRateLimit, async (_req, res) => {
+  try {
+    const pending = getPendingRequests();
+    res.json({
+      success: true,
+      data: { requests: pending },
+      message: `${pending.length} pending request(s)`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to get pending requests',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Approve a pending WalletConnect request
+router.post('/api/walletconnect/requests/:id/approve', checkRateLimit, async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id, 10);
+    if (isNaN(requestId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid request ID',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const result = await approveRequest(requestId);
+    if (!result.success) {
+      return res.status(404).json({
+        success: false,
+        error: 'Not Found',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      data: { result: result.result },
+      message: 'Request approved and executed',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to approve request',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Reject a pending WalletConnect request
+router.post('/api/walletconnect/requests/:id/reject', checkRateLimit, async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id, 10);
+    if (isNaN(requestId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid request ID',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    await rejectRequest(requestId);
+    res.json({
+      success: true,
+      message: 'Request rejected',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    res.status(error.message?.includes('No pending request') ? 404 : 500).json({
+      success: false,
+      error: error.message?.includes('No pending request') ? 'Not Found' : 'Internal Server Error',
+      message: error?.message || 'Failed to reject request',
       timestamp: new Date().toISOString(),
     });
   }
