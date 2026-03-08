@@ -16,6 +16,31 @@ import { toSafeSmartAccount } from 'permissionless/accounts';
 
 const router = Router();
 
+const SUPPORTED_CHAINS_LIST = 'Ethereum (1), Base (8453), Polygon (137), Celo (42220), Arbitrum (42161), Avalanche (43114), BSC (56), Berachain (80094), Lisk (1135)';
+
+function getChainConfig(chainId: number): { bundlerUrl: string; paymasterRPC: string; envPrefix: string } | null {
+  const configs: Record<number, { envPrefix: string }> = {
+    1: { envPrefix: 'ETHEREUM' },
+    8453: { envPrefix: 'BASE' },
+    137: { envPrefix: 'POLYGON' },
+    42220: { envPrefix: 'CELO' },
+    42161: { envPrefix: 'ARBITRUM' },
+    43114: { envPrefix: 'AVALANCHE' },
+    56: { envPrefix: 'BSC' },
+    80094: { envPrefix: 'BERACHAIN' },
+    1135: { envPrefix: 'LISK' },
+  };
+
+  const config = configs[chainId];
+  if (!config) return null;
+
+  return {
+    bundlerUrl: process.env[`${config.envPrefix}_BUNDLER_URL`]!,
+    paymasterRPC: process.env[`${config.envPrefix}_PAYMASTER_RPC`]!,
+    envPrefix: config.envPrefix,
+  };
+}
+
 // Initialize rate limiter and circuit breakers for scalability
 const rateLimiter = new RateLimiter(1000, 60000); // 1000 requests per minute per IP
 const paymasterCircuitBreaker = new CircuitBreaker(5, 30000); // 5 failures, 30s timeout
@@ -139,36 +164,25 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
     }
 
     // Get bundler and paymaster URLs based on chainId
-    let bundlerUrl: string;
-    let paymasterRPC: string;
-
-    if (chainId === 1) { // Ethereum Mainnet
-      bundlerUrl = process.env.ETHEREUM_BUNDLER_URL!;
-      paymasterRPC = process.env.ETHEREUM_PAYMASTER_RPC!;
-    } else if (chainId === 8453) { // Base
-      bundlerUrl = process.env.BASE_BUNDLER_URL!;
-      paymasterRPC = process.env.BASE_PAYMASTER_RPC!;
-    } else if (chainId === 137) { // Polygon
-      bundlerUrl = process.env.POLYGON_BUNDLER_URL!;
-      paymasterRPC = process.env.POLYGON_PAYMASTER_RPC!;
-    } else if (chainId === 42220) { // Celo
-      bundlerUrl = process.env.CELO_BUNDLER_URL!;
-      paymasterRPC = process.env.CELO_PAYMASTER_RPC!;
-    } else {
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Ethereum (1), Base (8453), Polygon (137), Celo (42220)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
     }
 
+    const bundlerUrl = chainConfig.bundlerUrl;
+    const paymasterRPC = chainConfig.paymasterRPC;
+
     if (!bundlerUrl || !paymasterRPC) {
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check ETHEREUM_BUNDLER_URL/ETHEREUM_PAYMASTER_RPC, BASE_BUNDLER_URL/BASE_PAYMASTER_RPC, POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC, or CELO_BUNDLER_URL/CELO_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -369,36 +383,25 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
     }
 
     // Get bundler and paymaster URLs based on chainId
-    let bundlerUrl: string;
-    let paymasterRPC: string;
-
-    if (chainId === 1) { // Ethereum Mainnet
-      bundlerUrl = process.env.ETHEREUM_BUNDLER_URL!;
-      paymasterRPC = process.env.ETHEREUM_PAYMASTER_RPC!;
-    } else if (chainId === 8453) { // Base
-      bundlerUrl = process.env.BASE_BUNDLER_URL!;
-      paymasterRPC = process.env.BASE_PAYMASTER_RPC!;
-    } else if (chainId === 137) { // Polygon
-      bundlerUrl = process.env.POLYGON_BUNDLER_URL!;
-      paymasterRPC = process.env.POLYGON_PAYMASTER_RPC!;
-    } else if (chainId === 42220) { // Celo
-      bundlerUrl = process.env.CELO_BUNDLER_URL!;
-      paymasterRPC = process.env.CELO_PAYMASTER_RPC!;
-    } else {
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Ethereum (1), Base (8453), Polygon (137), Celo (42220)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
     }
 
+    const bundlerUrl = chainConfig.bundlerUrl;
+    const paymasterRPC = chainConfig.paymasterRPC;
+
     if (!bundlerUrl || !paymasterRPC) {
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check ETHEREUM_BUNDLER_URL/ETHEREUM_PAYMASTER_RPC, BASE_BUNDLER_URL/BASE_PAYMASTER_RPC, POLYGON_BUNDLER_URL/POLYGON_PAYMASTER_RPC, or CELO_BUNDLER_URL/CELO_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -469,7 +472,7 @@ router.post('/api/sign',  async (req, res) => {
       res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Ethereum (1), Base (8453), Polygon (137), Celo (42220)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -536,7 +539,7 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Ethereum (1), Base (8453), Polygon (137), Celo (42220)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
         timestamp: new Date().toISOString(),
       });
     }
@@ -555,7 +558,18 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
     }
 
     // Use provided RPC URL or default
-    const finalRpcUrl = rpcUrl || (chainId === 1 ? 'https://eth.llamarpc.com' : chainId === 8453 ? 'https://mainnet.base.org' : chainId === 42220 ? 'https://forno.celo.org' : 'https://polygon-rpc.com');
+    const defaultRpcUrls: Record<number, string> = {
+      1: 'https://eth.llamarpc.com',
+      8453: 'https://mainnet.base.org',
+      137: 'https://polygon-rpc.com',
+      42220: 'https://forno.celo.org',
+      42161: 'https://arb1.arbitrum.io/rpc',
+      43114: 'https://api.avax.network/ext/bc/C/rpc',
+      56: 'https://bsc-dataseed.binance.org',
+      80094: 'https://rpc.berachain.com/',
+      1135: 'https://rpc.api.lisk.com',
+    };
+    const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
 
     console.log(`🔍 Getting smart account address on chain ${chainId}`);
 
@@ -620,7 +634,7 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Unsupported Chain',
-        message: `Chain ID ${chainId} is not supported. Supported chains: Ethereum (1), Base (8453), Polygon (137), Celo (42220)`,
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
         timestamp: new Date().toISOString(),
       });
     }

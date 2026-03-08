@@ -16,7 +16,7 @@ import {
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
 import { privateKeyToAccount } from "viem/accounts";
-import { base, polygon, celo, mainnet } from "viem/chains";
+import { base, polygon, celo, mainnet, arbitrum, avalanche, bsc, berachain, lisk } from "viem/chains";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -25,7 +25,12 @@ export const CHAINS = {
   1: mainnet,
   8453: base,
   137: polygon,
-  42220: celo
+  42220: celo,
+  42161: arbitrum,
+  43114: avalanche,
+  56: bsc,
+  80094: berachain,
+  1135: lisk
 };
 
 /**
