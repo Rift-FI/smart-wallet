@@ -65,10 +65,18 @@ const PRICE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 /** Price markup in basis points (10000 = 100%, matches contract) */
 const PRICE_MARKUP = Number(process.env.LISK_PRICE_MARKUP) || 11000; // 110%
 
+/** Gelato API key for bundler */
+const GELATO_API_KEY = process.env.GELATO_API_KEY || "";
+
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 export function isLiskChain(chainId: number): boolean {
   return chainId === LISK_CHAIN_ID;
+}
+
+/** Returns the Gelato bundler URL for Lisk */
+export function getLiskBundlerUrl(): string {
+  return `https://api.gelato.cloud/rpc/${LISK_CHAIN_ID}?apiKey=${GELATO_API_KEY}`;
 }
 
 export function isLiskSupportedToken(tokenAddress: string): boolean {

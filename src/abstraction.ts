@@ -23,6 +23,7 @@ import {
   createLiskPaymasterMiddleware,
   getLiskGasFees,
   getLiskPaymasterAddress,
+  getLiskBundlerUrl,
   buildLiskPaymasterApprovalCall,
 } from "./lisk-paymaster";
 
@@ -95,14 +96,17 @@ export const submitTransaction = async (
       chain
     });
 
-    const pimlicoClient = createPimlicoClient({
-      chain,
-      transport: http(paymasterRPC),
-      entryPoint: {
-        address: entryPoint07Address,
-        version: "0.7" as EntryPointVersion,
-      },
-    });
+    // Create Pimlico client only for non-Lisk chains
+    const pimlicoClient = isLiskChain(chainId)
+      ? null
+      : createPimlicoClient({
+          chain,
+          transport: http(paymasterRPC),
+          entryPoint: {
+            address: entryPoint07Address,
+            version: "0.7" as EntryPointVersion,
+          },
+        });
 
     // Create signer from private key
     const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
@@ -119,8 +123,8 @@ export const submitTransaction = async (
 
     // Get token decimals from contract
     const tokenContract = new ethers.Contract(
-      tokenAddress, 
-      ['function decimals() view returns (uint8)'], 
+      tokenAddress,
+      ['function decimals() view returns (uint8)'],
       new ethers.providers.JsonRpcProvider(rpcNodeProvider)
     );
     const decimals = await tokenContract.decimals();
@@ -137,7 +141,7 @@ export const submitTransaction = async (
     // Check smart account deployment status
     const accountCode = await publicClient.getBytecode({ address: smartAccount.address });
     const isDeployed = accountCode && accountCode !== '0x';
-    
+
     console.log(`🏦 Smart account deployment status:`, {
       address: smartAccount.address,
       isDeployed,
@@ -152,17 +156,19 @@ export const submitTransaction = async (
     });
 
     // Create smart account client with ERC-20 paymaster (users pay gas in USDC)
-    const smartAccountClient = createSmartAccountClient({
-      account: smartAccount,
-      chain,
-      bundlerTransport: http(bundlerUrl),
-      paymaster: pimlicoClient, // ERC-20 Paymaster
-      userOperation: {
-        estimateFeesPerGas: async () => {
-          return (await pimlicoClient.getUserOperationGasPrice()).fast;
-        },
-      },
-    });
+    const smartAccountClient = isLiskChain(chainId)
+      ? null
+      : createSmartAccountClient({
+          account: smartAccount,
+          chain,
+          bundlerTransport: http(bundlerUrl),
+          paymaster: pimlicoClient!, // ERC-20 Paymaster
+          userOperation: {
+            estimateFeesPerGas: async () => {
+              return (await pimlicoClient!.getUserOperationGasPrice()).fast;
+            },
+          },
+        });
 
     // Check token balance first
     const senderTokenBalance = await publicClient.readContract({
@@ -195,10 +201,11 @@ export const submitTransaction = async (
       }
 
       const liskPaymaster = createLiskPaymasterMiddleware(tokenAddress as Address);
+      const liskBundlerUrl = getLiskBundlerUrl();
       const liskSmartAccountClient = createSmartAccountClient({
         account: smartAccount,
         chain,
-        bundlerTransport: http(bundlerUrl),
+        bundlerTransport: http(liskBundlerUrl),
         paymaster: liskPaymaster,
         userOperation: {
           estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
@@ -207,6 +214,7 @@ export const submitTransaction = async (
 
       const paymasterAddress = getLiskPaymasterAddress();
       console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
+      console.log(`📡 Using Gelato bundler for Lisk: ${liskBundlerUrl}`);
 
       userOperationHash = await liskSmartAccountClient.sendTransaction({
         calls: [
@@ -227,7 +235,7 @@ export const submitTransaction = async (
     } else {
       // ── Other chains: use Pimlico paymaster ──
       console.log(`💰 Getting token quotes for ERC-20 paymaster...`);
-      const quotes = await pimlicoClient.getTokenQuotes({
+      const quotes = await pimlicoClient!.getTokenQuotes({
         chain,
         tokens: [tokenAddress as Address],
       });
@@ -248,7 +256,7 @@ export const submitTransaction = async (
       }
       console.log(`💳 Using paymaster: ${paymaster}`);
 
-      userOperationHash = await smartAccountClient.sendTransaction({
+      userOperationHash = await smartAccountClient!.sendTransaction({
         calls: [
           {
             to: getAddress(tokenAddress),
@@ -357,14 +365,17 @@ export const submitUniversalTransaction = async (
       chain
     });
 
-    const pimlicoClient = createPimlicoClient({
-      chain,
-      transport: http(paymasterRPC),
-      entryPoint: {
-        address: entryPoint07Address,
-        version: "0.7" as EntryPointVersion,
-      },
-    });
+    // Create Pimlico client only for non-Lisk chains
+    const pimlicoClient = isLiskChain(chainId)
+      ? null
+      : createPimlicoClient({
+          chain,
+          transport: http(paymasterRPC),
+          entryPoint: {
+            address: entryPoint07Address,
+            version: "0.7" as EntryPointVersion,
+          },
+        });
 
     // Create signer from private key
     const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
@@ -382,7 +393,7 @@ export const submitUniversalTransaction = async (
     // Check smart account deployment status
     const accountCode = await publicClient.getBytecode({ address: smartAccount.address });
     const isDeployed = accountCode && accountCode !== '0x';
-    
+
     console.log(`🏦 Smart account deployment status:`, {
       address: smartAccount.address,
       isDeployed,
@@ -441,8 +452,10 @@ export const submitUniversalTransaction = async (
       }
 
       const liskPaymaster = createLiskPaymasterMiddleware(paymasterToken as Address);
+      const liskBundlerUrl = getLiskBundlerUrl();
       const paymasterAddress = getLiskPaymasterAddress();
       console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
+      console.log(`📡 Using Gelato bundler for Lisk: ${liskBundlerUrl}`);
 
       // Prepend approval for the custom paymaster
       transactionCalls.unshift(buildLiskPaymasterApprovalCall(paymasterToken as Address));
@@ -450,7 +463,7 @@ export const submitUniversalTransaction = async (
       smartAccountClient = createSmartAccountClient({
         account: smartAccount,
         chain,
-        bundlerTransport: http(bundlerUrl),
+        bundlerTransport: http(liskBundlerUrl),
         paymaster: liskPaymaster,
         userOperation: {
           estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
@@ -466,7 +479,7 @@ export const submitUniversalTransaction = async (
       if (paymasterToken) {
         console.log(`💰 Getting token quotes for ERC-20 paymaster with token: ${paymasterToken}...`);
 
-        const quotes = await pimlicoClient.getTokenQuotes({
+        const quotes = await pimlicoClient!.getTokenQuotes({
           chain,
           tokens: [paymasterToken as Address],
         });
@@ -505,10 +518,10 @@ export const submitUniversalTransaction = async (
         account: smartAccount,
         chain,
         bundlerTransport: http(bundlerUrl),
-        paymaster: pimlicoClient,
+        paymaster: pimlicoClient!,
         userOperation: {
           estimateFeesPerGas: async () => {
-            return (await pimlicoClient.getUserOperationGasPrice()).fast;
+            return (await pimlicoClient!.getUserOperationGasPrice()).fast;
           },
         },
       });
