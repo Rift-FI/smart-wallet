@@ -340,15 +340,56 @@ export function createLiskPaymasterMiddleware(tokenAddress: Address) {
 }
 
 /**
- * Estimate gas fees on Lisk using the public RPC (no Pimlico dependency).
+ * Estimate gas fees on Lisk — queries both the Gelato bundler and the RPC
+ * to get the highest recommended values, with aggressive floors to guarantee
+ * the UserOp is never rejected for insufficient fees.
  */
 export async function getLiskGasFees(rpcUrl: string) {
-  const client = createPublicClient({ transport: http(rpcUrl), chain: lisk });
-  const gasPrice = await client.getGasPrice();
-  // L2 gas is cheap — use simple multiplier
+  // Query multiple sources in parallel for resilience
+  const bundlerUrl = getLiskBundlerUrl();
+
+  const [rpcGasPrice, bundlerPrices] = await Promise.all([
+    // Source 1: Lisk RPC gasPrice
+    createPublicClient({ transport: http(rpcUrl), chain: lisk })
+      .getGasPrice()
+      .catch(() => 1_000_000n), // 1M wei fallback
+
+    // Source 2: Gelato bundler's recommended prices (pimlico-compatible method)
+    fetch(bundlerUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "rundler_maxPriorityFeePerGas",
+        params: [],
+        id: 1,
+      }),
+    })
+      .then((r) => r.json())
+      .then((r: any) => (r.result ? BigInt(r.result) : null))
+      .catch(() => null),
+  ]);
+
+  // Use the highest value from all sources
+  const ABSOLUTE_MIN_PRIORITY = 1_000_000n; // 1M wei — Gelato minimum is ~800K
+  const bundlerMinPriority = bundlerPrices ?? 0n;
+
+  // Take the max of: RPC gasPrice, bundler recommendation, absolute floor
+  let priorityFee = rpcGasPrice;
+  if (bundlerMinPriority > priorityFee) priorityFee = bundlerMinPriority;
+  if (ABSOLUTE_MIN_PRIORITY > priorityFee) priorityFee = ABSOLUTE_MIN_PRIORITY;
+
+  // Add 20% buffer on top to be safe
+  priorityFee = (priorityFee * 120n) / 100n;
+
+  // maxFeePerGas = 3x gasPrice + priorityFee — very generous to survive spikes
+  const maxFee = rpcGasPrice * 3n + priorityFee;
+
+  console.log(`⛽ Lisk gas fees: maxFeePerGas=${maxFee}, maxPriorityFeePerGas=${priorityFee}, rpcGasPrice=${rpcGasPrice}, bundlerMin=${bundlerMinPriority}`);
+
   return {
-    maxFeePerGas: (gasPrice * 150n) / 100n,       // 1.5x
-    maxPriorityFeePerGas: (gasPrice * 10n) / 100n, // 10% of base
+    maxFeePerGas: maxFee,
+    maxPriorityFeePerGas: priorityFee,
   };
 }
 
