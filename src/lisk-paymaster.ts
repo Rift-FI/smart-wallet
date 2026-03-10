@@ -278,8 +278,13 @@ export function createLiskPaymasterMiddleware(tokenAddress: Address) {
     getPaymasterStubData: async (_params: any) => {
       await fetchEthPrice();
       const { validUntil, validAfter } = getValidity();
-      // 65-byte dummy signature (won't pass on-chain validation, but same size)
-      const stubSignature = ("0x" + "ff".repeat(65)) as Hex;
+      // 65-byte dummy signature with valid ECDSA format (r=1, s=1, v=27)
+      // OZ v5 ECDSA.recover reverts on malformed sigs, so we need valid-format stub
+      const stubSignature = ("0x" +
+        "00".repeat(31) + "01" +    // r = 1 (32 bytes)
+        "00".repeat(31) + "01" +    // s = 1 (32 bytes, in lower half of curve)
+        "1b"                         // v = 27
+      ) as Hex;
 
       return {
         paymaster: LISK_PAYMASTER_ADDRESS,
