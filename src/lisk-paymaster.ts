@@ -31,12 +31,12 @@ export const LISK_CHAIN_ID = 1135;
 /** Supported tokens on Lisk */
 export const LISK_TOKENS: Record<string, { address: Address; decimals: number; symbol: string }> = {
   USDC: {
-    address: "0xf221689626305a468d601b380f2832968390cc71",
+    address: "0xF242275d3a6527d877f2c927a82D9b057609cc71",
     decimals: 6,
     symbol: "USDC",
   },
   USDT: {
-    address: "0x05d032aac4c31b251897415c8b97675270e517b9",
+    address: "0x05D032ac25d322df992303dCa074EE7392C117b9",
     decimals: 6,
     symbol: "USDT",
   },
