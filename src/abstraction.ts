@@ -3,20 +3,28 @@ import { ethers } from "ethers";
 import { createSmartAccountClient } from "permissionless";
 import { toSafeSmartAccount } from "permissionless/accounts";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
-import { 
-  createPublicClient, 
-  http, 
- 
-  Address, 
+import {
+  createPublicClient,
+  http,
+
+  Address,
   parseUnits,
   getAddress,
   maxUint256,
   parseAbi,
-  
+
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
 import { privateKeyToAccount } from "viem/accounts";
 import { base, polygon, celo, mainnet, arbitrum, avalanche, bsc, berachain, lisk } from "viem/chains";
+import {
+  isLiskChain,
+  isLiskSupportedToken,
+  createLiskPaymasterMiddleware,
+  getLiskGasFees,
+  getLiskPaymasterAddress,
+  buildLiskPaymasterApprovalCall,
+} from "./lisk-paymaster";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -173,50 +181,93 @@ export const submitTransaction = async (
       };
     }
 
-    // Get token quotes for ERC-20 paymaster
-    console.log(`💰 Getting token quotes for ERC-20 paymaster...`);
-    const quotes = await pimlicoClient.getTokenQuotes({
-      chain,
-      tokens: [tokenAddress as Address]
-    });
-    
-    if (!quotes || quotes.length === 0) {
-      return {
-        success: false,
-        error: `Token ${tokenAddress} not supported by ERC-20 paymaster`
-      };
-    }
-    
-    const paymaster = quotes[0]?.paymaster;
-    if (!paymaster) {
-      return {
-        success: false,
-        error: `No paymaster available for token ${tokenAddress}`
-      };
-    }
-    console.log(`💳 Using paymaster: ${paymaster}`);
-
-    // Send transaction with ERC-20 paymaster (user pays gas in tokens)
+    // Build and send UserOperation
     console.log(`🔧 Sending UserOperation with ERC-20 paymaster (gas paid in tokens)...`);
-    const userOperationHash = await smartAccountClient.sendTransaction({
-      calls: [
-        {
-          to: getAddress(tokenAddress),
-          abi: parseAbi(["function approve(address,uint256)"]),
-          functionName: "approve",
-          args: [paymaster, maxUint256],
+    let userOperationHash: string;
+
+    if (isLiskChain(chainId)) {
+      // ── Lisk: use custom paymaster ──
+      if (!isLiskSupportedToken(tokenAddress)) {
+        return {
+          success: false,
+          error: `Token ${tokenAddress} not supported by Lisk paymaster. Supported: USDC, USDT`,
+        };
+      }
+
+      const liskPaymaster = createLiskPaymasterMiddleware(tokenAddress as Address);
+      const liskSmartAccountClient = createSmartAccountClient({
+        account: smartAccount,
+        chain,
+        bundlerTransport: http(bundlerUrl),
+        paymaster: liskPaymaster,
+        userOperation: {
+          estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
         },
-        {
-          to: getAddress(tokenAddress),
-          abi: parseAbi(["function transfer(address,uint256)"]),
-          functionName: "transfer",
-          args: [getAddress(recipient), amountInWei],
-        }
-      ],
-      paymasterContext: {
-        token: tokenAddress as Address,
-      },
-    });
+      });
+
+      const paymasterAddress = getLiskPaymasterAddress();
+      console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
+
+      userOperationHash = await liskSmartAccountClient.sendTransaction({
+        calls: [
+          {
+            to: getAddress(tokenAddress),
+            abi: parseAbi(["function approve(address,uint256)"]),
+            functionName: "approve",
+            args: [paymasterAddress, maxUint256],
+          },
+          {
+            to: getAddress(tokenAddress),
+            abi: parseAbi(["function transfer(address,uint256)"]),
+            functionName: "transfer",
+            args: [getAddress(recipient), amountInWei],
+          },
+        ],
+      });
+    } else {
+      // ── Other chains: use Pimlico paymaster ──
+      console.log(`💰 Getting token quotes for ERC-20 paymaster...`);
+      const quotes = await pimlicoClient.getTokenQuotes({
+        chain,
+        tokens: [tokenAddress as Address],
+      });
+
+      if (!quotes || quotes.length === 0) {
+        return {
+          success: false,
+          error: `Token ${tokenAddress} not supported by ERC-20 paymaster`,
+        };
+      }
+
+      const paymaster = quotes[0]?.paymaster;
+      if (!paymaster) {
+        return {
+          success: false,
+          error: `No paymaster available for token ${tokenAddress}`,
+        };
+      }
+      console.log(`💳 Using paymaster: ${paymaster}`);
+
+      userOperationHash = await smartAccountClient.sendTransaction({
+        calls: [
+          {
+            to: getAddress(tokenAddress),
+            abi: parseAbi(["function approve(address,uint256)"]),
+            functionName: "approve",
+            args: [paymaster, maxUint256],
+          },
+          {
+            to: getAddress(tokenAddress),
+            abi: parseAbi(["function transfer(address,uint256)"]),
+            functionName: "transfer",
+            args: [getAddress(recipient), amountInWei],
+          },
+        ],
+        paymasterContext: {
+          token: tokenAddress as Address,
+        },
+      });
+    }
 
     console.log(`📤 UserOperation sent. Hash: ${userOperationHash}`);
     console.log(`🎉 Transaction submitted successfully!`);
@@ -378,64 +429,96 @@ export const submitUniversalTransaction = async (
     let smartAccountClient;
     let paymasterContext = {};
 
-    if (paymasterToken) {
-      // ERC-20 paymaster (user pays gas in tokens)
-      console.log(`💰 Getting token quotes for ERC-20 paymaster with token: ${paymasterToken}...`);
-      
-      const quotes = await pimlicoClient.getTokenQuotes({
-        chain,
-        tokens: [paymasterToken as Address]
-      });
-      
-      if (!quotes || quotes.length === 0) {
-        return {
-          success: false,
-          error: `Token ${paymasterToken} not supported by ERC-20 paymaster`
-        };
-      }
-      
-      const paymaster = quotes[0]?.paymaster;
-      if (!paymaster) {
-        return {
-          success: false,
-          error: `No paymaster available for token ${paymasterToken}`
-        };
-      }
-      
-      console.log(`💳 Using ERC-20 paymaster: ${paymaster}`);
-      paymasterContext = { token: paymasterToken as Address };
+    let userOperationHash: string;
 
-      // Add token approval call if using ERC-20 paymaster
-      transactionCalls.unshift({
-        to: getAddress(paymasterToken),
-        value: BigInt(0),
-        abi: parseAbi(["function approve(address,uint256)"]) as any,
-        functionName: "approve",
-        args: [paymaster, maxUint256],
+    if (isLiskChain(chainId) && paymasterToken) {
+      // ── Lisk with ERC-20 paymaster: use custom paymaster ──
+      if (!isLiskSupportedToken(paymasterToken)) {
+        return {
+          success: false,
+          error: `Token ${paymasterToken} not supported by Lisk paymaster. Supported: USDC, USDT`,
+        };
+      }
+
+      const liskPaymaster = createLiskPaymasterMiddleware(paymasterToken as Address);
+      const paymasterAddress = getLiskPaymasterAddress();
+      console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
+
+      // Prepend approval for the custom paymaster
+      transactionCalls.unshift(buildLiskPaymasterApprovalCall(paymasterToken as Address));
+
+      smartAccountClient = createSmartAccountClient({
+        account: smartAccount,
+        chain,
+        bundlerTransport: http(bundlerUrl),
+        paymaster: liskPaymaster,
+        userOperation: {
+          estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
+        },
+      });
+
+      console.log(`🔧 Sending UserOperation with Lisk custom paymaster...`);
+      userOperationHash = await smartAccountClient.sendTransaction({
+        calls: transactionCalls,
       });
     } else {
-      // Regular paymaster (sponsored gas)
-      console.log(`💳 Using sponsored gas paymaster`);
-    }
+      // ── Other chains (or Lisk without paymaster token): use Pimlico ──
+      if (paymasterToken) {
+        console.log(`💰 Getting token quotes for ERC-20 paymaster with token: ${paymasterToken}...`);
 
-    smartAccountClient = createSmartAccountClient({
-      account: smartAccount,
-      chain,
-      bundlerTransport: http(bundlerUrl),
-      paymaster: pimlicoClient,
-      userOperation: {
-        estimateFeesPerGas: async () => {
-          return (await pimlicoClient.getUserOperationGasPrice()).fast;
+        const quotes = await pimlicoClient.getTokenQuotes({
+          chain,
+          tokens: [paymasterToken as Address],
+        });
+
+        if (!quotes || quotes.length === 0) {
+          return {
+            success: false,
+            error: `Token ${paymasterToken} not supported by ERC-20 paymaster`,
+          };
+        }
+
+        const paymaster = quotes[0]?.paymaster;
+        if (!paymaster) {
+          return {
+            success: false,
+            error: `No paymaster available for token ${paymasterToken}`,
+          };
+        }
+
+        console.log(`💳 Using ERC-20 paymaster: ${paymaster}`);
+        paymasterContext = { token: paymasterToken as Address };
+
+        // Add token approval call if using ERC-20 paymaster
+        transactionCalls.unshift({
+          to: getAddress(paymasterToken),
+          value: BigInt(0),
+          abi: parseAbi(["function approve(address,uint256)"]) as any,
+          functionName: "approve",
+          args: [paymaster, maxUint256],
+        });
+      } else {
+        console.log(`💳 Using sponsored gas paymaster`);
+      }
+
+      smartAccountClient = createSmartAccountClient({
+        account: smartAccount,
+        chain,
+        bundlerTransport: http(bundlerUrl),
+        paymaster: pimlicoClient,
+        userOperation: {
+          estimateFeesPerGas: async () => {
+            return (await pimlicoClient.getUserOperationGasPrice()).fast;
+          },
         },
-      },
-    });
+      });
 
-    // Send transaction
-    console.log(`🔧 Sending UserOperation with ${paymasterToken ? 'ERC-20' : 'sponsored'} paymaster...`);
-    const userOperationHash = await smartAccountClient.sendTransaction({
-      calls: transactionCalls,
-      ...(paymasterToken ? { paymasterContext } : {})
-    });
+      console.log(`🔧 Sending UserOperation with ${paymasterToken ? 'ERC-20' : 'sponsored'} paymaster...`);
+      userOperationHash = await smartAccountClient.sendTransaction({
+        calls: transactionCalls,
+        ...(paymasterToken ? { paymasterContext } : {}),
+      });
+    }
 
     console.log(`📤 UserOperation sent. Hash: ${userOperationHash}`);
     console.log(`🎉 Universal transaction submitted successfully!`);
