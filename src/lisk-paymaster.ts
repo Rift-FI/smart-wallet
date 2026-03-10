@@ -295,22 +295,24 @@ export function createLiskPaymasterMiddleware(tokenAddress: Address) {
      */
     getPaymasterData: async (params: any) => {
       await fetchEthPrice();
-      const userOp = params.userOperation;
+      // params is a flat object with UserOp fields + chainId + entryPointAddress
       const { validUntil, validAfter } = getValidity();
+
+      console.log(`🔑 Signing paymaster data for sender: ${params.sender}`);
 
       // Compute hash matching the on-chain getHash()
       const hash = computePaymasterHash(
         {
-          sender: userOp.sender,
-          nonce: BigInt(userOp.nonce),
-          factory: userOp.factory,
-          factoryData: userOp.factoryData,
-          callData: userOp.callData,
-          callGasLimit: BigInt(userOp.callGasLimit),
-          verificationGasLimit: BigInt(userOp.verificationGasLimit),
-          preVerificationGas: BigInt(userOp.preVerificationGas),
-          maxFeePerGas: BigInt(userOp.maxFeePerGas),
-          maxPriorityFeePerGas: BigInt(userOp.maxPriorityFeePerGas),
+          sender: params.sender,
+          nonce: BigInt(params.nonce),
+          factory: params.factory,
+          factoryData: params.factoryData,
+          callData: params.callData,
+          callGasLimit: BigInt(params.callGasLimit),
+          verificationGasLimit: BigInt(params.verificationGasLimit),
+          preVerificationGas: BigInt(params.preVerificationGas),
+          maxFeePerGas: BigInt(params.maxFeePerGas),
+          maxPriorityFeePerGas: BigInt(params.maxPriorityFeePerGas),
         },
         tokenAddress,
         validUntil,
