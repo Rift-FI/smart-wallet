@@ -209,6 +209,15 @@ export const submitTransaction = async (
         paymaster: liskPaymaster,
         userOperation: {
           estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
+          estimateGas: async (args: { userOperation: any }) => {
+            // Apply 1.5x gas buffer for Gelato bundler — prevents "Compute Unit Limit Exceeded"
+            const op = args.userOperation;
+            return {
+              callGasLimit: BigInt(Math.ceil(Number(op.callGasLimit || 100000n) * 1.5)),
+              verificationGasLimit: BigInt(Math.ceil(Number(op.verificationGasLimit || 100000n) * 1.5)),
+              preVerificationGas: BigInt(Math.ceil(Number(op.preVerificationGas || 60000n) * 1.5)),
+            };
+          },
         },
       });
 
@@ -467,6 +476,14 @@ export const submitUniversalTransaction = async (
         paymaster: liskPaymaster,
         userOperation: {
           estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
+          estimateGas: async (args: { userOperation: any }) => {
+            const op = args.userOperation;
+            return {
+              callGasLimit: BigInt(Math.ceil(Number(op.callGasLimit || 100000n) * 1.5)),
+              verificationGasLimit: BigInt(Math.ceil(Number(op.verificationGasLimit || 100000n) * 1.5)),
+              preVerificationGas: BigInt(Math.ceil(Number(op.preVerificationGas || 60000n) * 1.5)),
+            };
+          },
         },
       });
 

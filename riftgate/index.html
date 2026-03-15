@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Light Infra &mdash; Smart Wallet API Docs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600;700&family=Patrick+Hand&family=Architects+Daughter&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --font-hand: 'Caveat', 'Patrick Hand', cursive;
+      --font-body: 'Architects Daughter', 'Patrick Hand', cursive;
+      --font-mono: 'JetBrains Mono', 'Consolas', monospace;
+      --max-w: 960px;
+      --radius: 3px;
+    }
+
+    [data-theme="light"] {
+      --bg: #fdf6e3;
+      --bg-paper: #fffef7;
+      --bg-card: #fff9ed;
+      --bg-code: #f5efe0;
+      --border: #c8b890;
+      --border-light: #ddd3ba;
+      --border-rule: #d4c9a8;
+      --text: #3c3226;
+      --text-dim: #7a6e5a;
+      --text-heading: #1a1610;
+      --ink: #1a1610;
+      --ink-blue: #1b4f72;
+      --ink-red: #922b21;
+      --ink-green: #196f3d;
+      --ink-purple: #6c3483;
+      --ink-orange: #a04000;
+      --accent: #2c3e50;
+      --highlight: rgba(255, 235, 59, 0.25);
+      --sidebar-bg: #f7f0de;
+      --sidebar-hover: #efe7d0;
+      --paper-lines: rgba(180, 160, 120, 0.15);
+      --paper-margin: rgba(200, 50, 50, 0.12);
+    }
+
+    [data-theme="dark"] {
+      --bg: #1a1812;
+      --bg-paper: #22201a;
+      --bg-card: #2a2720;
+      --bg-code: #1e1c16;
+      --border: #4a4435;
+      --border-light: #3a352a;
+      --border-rule: #3a352a;
+      --text: #d4c9a8;
+      --text-dim: #8a7e68;
+      --text-heading: #f0e8d0;
+      --ink: #f0e8d0;
+      --ink-blue: #6ca6d4;
+      --ink-red: #e07060;
+      --ink-green: #6fbf7f;
+      --ink-purple: #b088d0;
+      --ink-orange: #e0a050;
+      --accent: #c8b890;
+      --highlight: rgba(255, 235, 59, 0.08);
+      --sidebar-bg: #1e1c16;
+      --sidebar-hover: #2a2720;
+      --paper-lines: rgba(120, 110, 80, 0.12);
+      --paper-margin: rgba(180, 60, 60, 0.08);
+    }
+
+    body {
+      font-family: var(--font-body);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 1.05rem;
+      line-height: 1.75;
+    }
+
+    /* ── Paper texture ────────────────────────────────── */
+    .main {
+      margin-left: 260px;
+      padding: 2.5rem 4rem 4rem;
+      background: var(--bg-paper);
+      min-height: 100vh;
+      border-left: 3px solid var(--paper-margin);
+      background-image:
+        repeating-linear-gradient(transparent, transparent 31px, var(--paper-lines) 31px, var(--paper-lines) 32px);
+      background-size: 100% 32px;
+      position: relative;
+    }
+
+    /* ── Sidebar ──────────────────────────────────────── */
+    .sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0;
+      width: 260px;
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border-light);
+      padding: 1.5rem 0;
+      overflow-y: auto;
+      z-index: 50;
+    }
+
+    .sidebar-header {
+      padding: 0 1.25rem 1.25rem;
+      border-bottom: 1px dashed var(--border);
+      display: flex; align-items: center; gap: 0.65rem;
+    }
+
+    .sidebar-header img { width: 36px; height: 36px; }
+
+    .sidebar-header h1 {
+      font-family: var(--font-hand);
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: var(--ink);
+      line-height: 1.1;
+    }
+
+    .sidebar-header span {
+      display: block;
+      font-family: var(--font-body);
+      font-size: 0.78rem;
+      color: var(--text-dim);
+      font-weight: 400;
+    }
+
+    .sidebar nav { display: flex; flex-direction: column; gap: 1px; padding-top: 0.75rem; }
+
+    .sidebar .nav-section {
+      font-family: var(--font-hand);
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-dim);
+      padding: 0.75rem 1.25rem 0.25rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .sidebar a {
+      display: block;
+      padding: 0.3rem 1.25rem 0.3rem 1.75rem;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.9rem;
+      border-left: 3px solid transparent;
+      transition: all 0.15s;
+    }
+
+    .sidebar a:hover {
+      color: var(--ink);
+      background: var(--sidebar-hover);
+      border-left-color: var(--border);
+    }
+
+    .sidebar a.active {
+      color: var(--ink);
+      border-left-color: var(--ink);
+      font-weight: 600;
+      background: var(--highlight);
+    }
+
+    /* ── Theme toggle ─────────────────────────────────── */
+    .theme-toggle {
+      position: fixed; top: 1rem; right: 1.5rem;
+      display: flex; gap: 0.75rem; align-items: center; z-index: 100;
+    }
+
+    .theme-toggle button, .theme-toggle a {
+      font-family: var(--font-body);
+      background: var(--bg-card);
+      border: 1px dashed var(--border);
+      color: var(--text);
+      padding: 0.35rem 0.75rem;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 0.82rem;
+      text-decoration: none;
+      transition: all 0.15s;
+    }
+    .theme-toggle button:hover, .theme-toggle a:hover {
+      background: var(--highlight);
+      color: var(--ink);
+    }
+
+    /* ── Mobile menu ──────────────────────────────────── */
+    .menu-toggle {
+      display: none; position: fixed; top: 1rem; left: 1rem;
+      background: var(--bg-card); border: 1px dashed var(--border);
+      color: var(--text); font-size: 1.2rem; padding: 0.4rem 0.7rem;
+      border-radius: var(--radius); cursor: pointer; z-index: 100;
+    }
+
+    @media (max-width: 768px) {
+      .sidebar { transform: translateX(-100%); transition: transform 0.3s; z-index: 200; }
+      .sidebar.open { transform: translateX(0); }
+      .main { margin-left: 0; padding: 1.5rem 0.75rem; border-left: none; }
+      .hero h2 { font-size: 2rem; }
+      .menu-toggle { display: block; }
+      .theme-toggle { top: 1rem; right: 0.75rem; }
+      h2 { font-size: 1.6rem; margin: 1.5rem 0 0.75rem; }
+      h3 { font-size: 1.3rem; }
+      pre { font-size: 0.72rem; padding: 0.75rem 0.5rem; word-break: break-all; white-space: pre-wrap; }
+      .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0.75rem -0.75rem 1.25rem; padding: 0 0.75rem; }
+      table { font-size: 0.78rem; min-width: 500px; }
+      th, td { padding: 0.35rem 0.5rem; }
+      th { font-size: 0.9rem; }
+      .endpoint-header { flex-wrap: wrap; gap: 0.4rem; }
+      .endpoint-path { font-size: 0.75rem; word-break: break-all; }
+      .flow { font-size: 0.65rem; }
+      .card-grid { grid-template-columns: 1fr; }
+      .callout { font-size: 0.85rem; }
+      .lead { font-size: 0.95rem; padding: 0.75rem; }
+      .copy-btn { opacity: 1; font-size: 0.65rem; padding: 2px 6px; }
+    }
+
+    /* ── Typography ───────────────────────────────────── */
+    h2 {
+      font-family: var(--font-hand);
+      font-size: 2.2rem;
+      font-weight: 700;
+      color: var(--ink);
+      margin: 2.5rem 0 1rem;
+      padding-bottom: 0.4rem;
+      border-bottom: 2px solid var(--border-rule);
+      position: relative;
+    }
+
+    h3 {
+      font-family: var(--font-hand);
+      font-size: 1.6rem;
+      font-weight: 600;
+      color: var(--ink);
+      margin: 2rem 0 0.75rem;
+    }
+
+    h4 {
+      font-family: var(--font-hand);
+      font-size: 1.3rem;
+      font-weight: 500;
+      color: var(--text-heading);
+      margin: 1.25rem 0 0.5rem;
+    }
+
+    p { margin-bottom: 0.75rem; }
+
+    a { color: var(--ink-blue); }
+
+    strong { color: var(--ink); }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      background: var(--bg-code);
+      padding: 0.15rem 0.4rem;
+      border-radius: 2px;
+      border: 1px solid var(--border-light);
+    }
+
+    pre {
+      background: var(--bg-code);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin: 0.75rem 0 1.25rem;
+      font-size: 0.82rem;
+      line-height: 1.6;
+      position: relative;
+    }
+
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+    }
+
+    .copy-btn {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      background: var(--bg-paper);
+      border: 1px dashed var(--border);
+      border-radius: 3px;
+      padding: 3px 10px;
+      font-family: var(--font-body);
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.2s;
+      z-index: 2;
+    }
+    pre:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { color: var(--text); border-color: var(--text-dim); }
+    .copy-btn.copied { color: var(--ink-green); border-color: var(--ink-green); }
+
+    .lead {
+      font-size: 1.1rem;
+      color: var(--text);
+      margin-bottom: 1.5rem;
+      padding: 1rem;
+      background: var(--highlight);
+      border-left: 3px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    /* ── Syntax colors ────────────────────────────────── */
+    .s-kw { color: var(--ink-purple); font-weight: 500; }
+    .s-str { color: var(--ink-green); }
+    .s-num { color: var(--ink-orange); }
+    .s-fn { color: var(--ink-blue); }
+    .s-comment { color: var(--text-dim); font-style: italic; }
+    .s-key { color: var(--ink-red); }
+    .s-bool { color: var(--ink-orange); }
+
+    /* ── Flow diagram colors ──────────────────────────── */
+    .hl { color: var(--ink); font-weight: 700; text-decoration: underline; text-decoration-style: wavy; text-underline-offset: 3px; }
+    .gr { color: var(--ink-green); }
+    .bl { color: var(--ink-blue); }
+    .or { color: var(--ink-orange); }
+
+    /* ── Tables ───────────────────────────────────────── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 0.75rem 0 1.25rem;
+      font-size: 0.92rem;
+    }
+
+    th {
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+      font-family: var(--font-hand);
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: var(--ink);
+      border-bottom: 2px solid var(--border);
+    }
+
+    td {
+      padding: 0.45rem 0.75rem;
+      border-bottom: 1px dashed var(--border-light);
+    }
+
+    tr:last-child td { border-bottom: none; }
+
+    .addr {
+      font-family: var(--font-mono);
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      word-break: break-all;
+    }
+
+    /* ── Tags ─────────────────────────────────────────── */
+    .tag {
+      font-family: var(--font-hand);
+      font-size: 0.9rem;
+      font-weight: 600;
+      padding: 0.1rem 0.5rem;
+      border-radius: 2px;
+      border: 1px dashed;
+    }
+    .tag-purple { color: var(--ink-purple); border-color: var(--ink-purple); }
+    .tag-green { color: var(--ink-green); border-color: var(--ink-green); }
+    .tag-orange { color: var(--ink-orange); border-color: var(--ink-orange); }
+
+    /* ── Cards ────────────────────────────────────────── */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.25rem;
+      margin: 1rem 0 1.5rem;
+    }
+
+    @media (max-width: 900px) {
+      .card-grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      transition: transform 0.15s;
+    }
+    .card:hover { transform: rotate(-0.5deg); }
+
+    .card h4 { margin-top: 0; }
+
+    /* ── Callouts ─────────────────────────────────────── */
+    .callout {
+      background: var(--highlight);
+      border-left: 3px solid var(--ink-green);
+      padding: 0.85rem 1rem;
+      margin: 1rem 0;
+      border-radius: var(--radius);
+      font-size: 0.95rem;
+    }
+
+    .callout-warning {
+      border-left-color: var(--ink-red);
+      background: rgba(200, 50, 50, 0.06);
+    }
+
+    /* ── Flow diagrams ────────────────────────────────── */
+    .flow {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      line-height: 1.5;
+      white-space: pre;
+      overflow-x: auto;
+      background: var(--bg-card);
+      border: 1px dashed var(--border);
+      padding: 1rem 1.25rem;
+      margin: 0.75rem 0 1.25rem;
+      border-radius: var(--radius);
+    }
+
+    /* ── Endpoints ────────────────────────────────────── */
+    .endpoint {
+      border: 1px dashed var(--border);
+      border-radius: var(--radius);
+      margin: 1rem 0;
+      overflow: hidden;
+    }
+
+    .endpoint-header {
+      display: flex; align-items: center; gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      cursor: pointer;
+      background: var(--bg-card);
+      border-bottom: 1px dashed var(--border-light);
+    }
+    .endpoint-header:hover { background: var(--highlight); }
+
+    .method {
+      font-family: var(--font-hand);
+      font-size: 1rem;
+      font-weight: 700;
+      padding: 0.15rem 0.6rem;
+      border-radius: 2px;
+      border: 1px solid;
+    }
+    .method-post { color: var(--ink-blue); border-color: var(--ink-blue); }
+
+    .endpoint-path {
+      font-family: var(--font-mono);
+      font-size: 0.88rem;
+      font-weight: 500;
+      color: var(--ink);
+    }
+
+    .endpoint-desc {
+      font-size: 0.85rem;
+      color: var(--text-dim);
+      margin-left: auto;
+    }
+
+    .endpoint-body {
+      padding: 1rem 1.25rem;
+      display: none;
+    }
+
+    .endpoint.open .endpoint-body { display: block; }
+
+    /* ── Hero ─────────────────────────────────────────── */
+    .hero {
+      text-align: center;
+      padding: 2rem 1rem 2.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .hero h2 {
+      font-family: var(--font-hand);
+      font-size: 3.5rem;
+      border: none;
+      margin: 0.25rem 0;
+      letter-spacing: -0.02em;
+    }
+
+    .hero-badge {
+      font-family: var(--font-hand);
+      font-size: 1rem;
+      color: var(--text-dim);
+      border: 1px dashed var(--border);
+      padding: 0.2rem 0.75rem;
+      border-radius: 2px;
+    }
+
+    .hero p {
+      font-size: 1.15rem;
+      color: var(--text-dim);
+      max-width: 600px;
+      margin: 0.75rem auto 0;
+    }
+
+    /* ── Sketchy decorations ──────────────────────────── */
+    .sketch-underline {
+      text-decoration: underline;
+      text-decoration-style: wavy;
+      text-underline-offset: 3px;
+      text-decoration-color: var(--border);
+    }
+
+    /* ── Footer ───────────────────────────────────────── */
+    footer {
+      text-align: center;
+      padding: 2rem 0;
+      border-top: 2px dashed var(--border);
+      margin-top: 3rem;
+      font-family: var(--font-hand);
+      font-size: 1rem;
+      color: var(--text-dim);
+    }
+
+    footer a { color: var(--ink-blue); text-decoration: none; }
+
+    /* ── Scrollbar ────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<button class="menu-toggle" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+
+<div class="theme-toggle">
+  <a href="dashboard.html">Dashboard</a>
+  <button onclick="toggleTheme()"><span class="theme-label">Dark</span></button>
+</div>
+
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <a href="index.html" style="display:flex;align-items:center"><img src="logo.svg" alt="Light Infra"></a>
+    <h1>Light Infra <span>Smart Wallet API</span></h1>
+  </div>
+  <nav>
+    <div class="nav-section">Overview</div>
+    <a href="#overview">Introduction</a>
+    <a href="#architecture">Architecture</a>
+    <a href="#chains">Supported Chains</a>
+
+    <div class="nav-section">Smart Contract</div>
+    <a href="#lisk-paymaster">LiskPaymaster</a>
+    <a href="#contract-functions">Functions</a>
+    <a href="#token-config">Token Config</a>
+
+    <div class="nav-section">Infrastructure</div>
+    <a href="#bundlers">Bundlers</a>
+    <a href="#paymaster-flow">Paymaster Flow</a>
+    <a href="#gas-pricing">Gas Pricing</a>
+
+    <div class="nav-section">V2 API</div>
+    <a href="#client-signing">Client-Side Signing</a>
+    <a href="#prepare-endpoint">POST /v2/prepare</a>
+    <a href="#submit-endpoint">POST /v2/submit</a>
+    <a href="#bridging">Cross-Chain Bridging</a>
+
+    <div class="nav-section">Wallet Integrations</div>
+    <a href="#signing-guide">Signing Guide</a>
+    <a href="#privy">Privy</a>
+    <a href="#wagmi">wagmi / RainbowKit</a>
+    <a href="#server-side">Server-Side (ethers)</a>
+
+    <div class="nav-section">Examples</div>
+    <a href="#example-transfer">Token Transfer</a>
+    <a href="#example-approve">Approve + Contract Calls</a>
+    <a href="#example-multicall">Multi-Call</a>
+    <a href="#example-bridge">Bridge (Across)</a>
+
+    <div class="nav-section">AI / LLM</div>
+    <a href="#llm-usage">Use with Claude</a>
+    <a href="api-reference.md" download>Download API Reference</a>
+
+    <div class="nav-section">Live</div>
+    <a href="dashboard.html">Paymaster Dashboard</a>
+  </nav>
+</aside>
+
+<div class="main">
+
+  <section class="hero" id="overview">
+    <span class="hero-badge">ERC-4337 Account Abstraction</span>
+    <h2>Light Infra</h2>
+    <p>Gasless smart wallet infrastructure with client-side signing. No private keys on the server&mdash;ever.</p>
+  </section>
+
+  <p class="lead">
+    Light Infra is a production API for <strong>gasless smart account transactions</strong> using ERC-4337. Send tokens, approve contracts, execute swaps, bridge cross-chain &mdash; all without users needing ETH for gas. The V2 API uses a <strong>prepare &rarr; sign &rarr; submit</strong> flow so private keys never leave the client.
+  </p>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4>Client-Side Signing</h4>
+      <p style="color:var(--text-dim); font-size:0.95rem;">Private keys never touch the server. Sign with Privy, MetaMask, wagmi, ethers, viem &mdash; any wallet.</p>
+    </div>
+    <div class="card">
+      <h4>Any Transaction, Gasless</h4>
+      <p style="color:var(--text-dim); font-size:0.95rem;">Transfers, approvals, swaps, mints, contract calls &mdash; gas paid in USDC/USDT, not ETH.</p>
+    </div>
+    <div class="card">
+      <h4>Multi-Chain + Bridging</h4>
+      <p style="color:var(--text-dim); font-size:0.95rem;">9 chains, same smart account address everywhere. Cross-chain bridging via Across Protocol.</p>
+    </div>
+  </div>
+
+  <h2 id="architecture">Architecture</h2>
+
+  <div class="flow"><span class="hl">Client</span>                        <span class="hl">Light Infra</span>                   <span class="hl">Bundler</span>
+  |                               |                               |
+  |  POST /api/v2/prepare         |                               |
+  |  { ownerAddress, chainId,     |                               |
+  |    token, amount, ... }       |                               |
+  |<span class="gr">------------------------------&gt;</span>|                               |
+  |                               |  Build UserOp, estimate gas,  |
+  |                               |  get paymaster signature      |
+  |  { userOperation, hashToSign }|                               |
+  |<span class="bl">&lt;------------------------------</span>|                               |
+  |                               |                               |
+  |  <span class="or">Sign hashToSign locally</span>      |                               |
+  |  <span class="or">(personal_sign / eth_sign)</span>   |                               |
+  |                               |                               |
+  |  POST /api/v2/submit          |                               |
+  |  { userOperation, signature } |                               |
+  |<span class="gr">------------------------------&gt;</span>|                               |
+  |                               |  <span class="gr">eth_sendUserOperation</span>        |
+  |                               |<span class="gr">------------------------------&gt;</span>|
+  |                               |  userOperationHash            |
+  |  { userOperationHash }        |<span class="bl">&lt;------------------------------</span>|
+  |<span class="bl">&lt;------------------------------</span>|                               |</div>
+
+  <h2 id="chains">Supported Chains</h2>
+
+  <table>
+    <thead>
+      <tr><th>Chain</th><th>ID</th><th>Bundler</th><th>Paymaster</th><th>Gas Tokens</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Ethereum</td><td><code>1</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC</td></tr>
+      <tr><td>Base</td><td><code>8453</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC</td></tr>
+      <tr><td>Polygon</td><td><code>137</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC, USDT</td></tr>
+      <tr><td>Celo</td><td><code>42220</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC, USDT</td></tr>
+      <tr><td>Arbitrum</td><td><code>42161</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC</td></tr>
+      <tr><td>Avalanche</td><td><code>43114</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC</td></tr>
+      <tr><td>BNB Chain</td><td><code>56</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDT</td></tr>
+      <tr><td>Berachain</td><td><code>80094</code></td><td><span class="tag tag-purple">Pimlico</span></td><td>Pimlico ERC-20</td><td>USDC</td></tr>
+      <tr style="background: var(--highlight);">
+        <td><strong>Lisk</strong></td>
+        <td><code>1135</code></td>
+        <td><span class="tag tag-green">Gelato</span></td>
+        <td><span class="tag tag-orange">Custom</span> LiskPaymaster</td>
+        <td>Bridged USDC, Bridged USDT</td>
+      </tr>
+    </tbody>
+  </table>
+  <p style="color:var(--text-dim); font-size:0.9rem;">
+    <strong>Note:</strong> Lisk uses <em>bridged</em> versions of USDC and USDT &mdash; these are not native Circle/Tether tokens but ERC-20s bridged to Lisk via the canonical bridge. Same 6-decimal format.
+  </p>
+
+  <div class="callout">
+    <strong>Transparent routing:</strong> The API interface is identical for all chains. Lisk uses a custom verifying paymaster + Gelato bundler behind the scenes, but callers send the exact same request format.
+  </div>
+
+  <h2 id="lisk-paymaster">LiskPaymaster Contract</h2>
+
+  <p>A self-hosted <strong>verifying paymaster</strong> for Lisk (chain 1135), deployed because Pimlico does not support Lisk. ERC-4337 v0.7 paymaster spec with EntryPoint <code>0x0000000071727De22E5E9d8BAf0edAc6f37da032</code>.</p>
+
+  <table>
+    <tbody>
+      <tr><td style="width:160px; color:var(--text-dim);">Contract</td><td><span class="addr">0x427236c2FbF46372e115027c367E63Bbb11F932C</span></td></tr>
+      <tr><td style="color:var(--text-dim);">Chain</td><td>Lisk Mainnet (1135)</td></tr>
+      <tr><td style="color:var(--text-dim);">EntryPoint</td><td><span class="addr">0x0000000071727De22E5E9d8BAf0edAc6f37da032</span> (v0.7)</td></tr>
+      <tr><td style="color:var(--text-dim);">Standard</td><td>ERC-4337 <code>IPaymaster</code> via <code>BasePaymaster</code></td></tr>
+      <tr><td style="color:var(--text-dim);">Source</td><td><a href="https://blockscout.lisk.com/address/0x427236c2FbF46372e115027c367E63Bbb11F932C" target="_blank">View on Blockscout</a></td></tr>
+    </tbody>
+  </table>
+
+  <h3>Supported Tokens</h3>
+  <table>
+    <thead><tr><th>Token</th><th>Address</th><th>Decimals</th></tr></thead>
+    <tbody>
+      <tr><td>Bridged USDC</td><td><span class="addr">0xF242275d3a6527d877f2c927a82D9b057609cc71</span></td><td>6</td></tr>
+      <tr><td>Bridged USDT</td><td><span class="addr">0x05D032ac25d322df992303dCa074EE7392C117b9</span></td><td>6</td></tr>
+    </tbody>
+  </table>
+
+  <h3>How It Works</h3>
+
+  <div class="flow"> 1. <span class="hl">Backend signs</span> the UserOperation off-chain with LISK_PAYMASTER_SIGNER_KEY
+ 2. <span class="hl">validatePaymasterUserOp</span> verifies the backend signature on-chain
+    <span class="gr">|-- Checks token is configured</span>
+    <span class="gr">|-- Checks validUntil / validAfter timestamps</span>
+    <span class="gr">`-- Recovers signer via ECDSA &amp; compares to verifyingSigner</span>
+ 3. <span class="bl">User's callData executes</span> (token approve + transfer)
+ 4. <span class="or">postOp</span> pulls tokens from the smart account to cover gas
+    <span class="or">|-- tokenCost = gasUsed * ethPrice * markup / 1e18</span>
+    <span class="or">`-- Transfers tokens from sender -> paymaster owner</span>
+ 5. Transaction complete, user paid gas in USDC/USDT</div>
+
+  <h3 id="contract-functions">Key Contract Functions</h3>
+
+  <table>
+    <thead><tr><th>Function</th><th>Access</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>configureToken(address, uint256, bool)</code></td><td><span class="tag tag-orange">Owner</span></td><td>Set token price per ETH and enable/disable</td></tr>
+      <tr><td><code>setVerifyingSigner(address)</code></td><td><span class="tag tag-orange">Owner</span></td><td>Update the off-chain signer address</td></tr>
+      <tr><td><code>getHash(PackedUserOperation, address, uint48, uint48)</code></td><td><span class="tag tag-green">View</span></td><td>Compute the hash that the backend signer signs</td></tr>
+      <tr><td><code>getTokenCostForGas(uint256, address)</code></td><td><span class="tag tag-green">View</span></td><td>Calculate token amount for a given gas cost in wei</td></tr>
+      <tr><td><code>deposit()</code></td><td><span class="tag tag-orange">Owner</span></td><td>Fund the paymaster's EntryPoint deposit (pays for gas)</td></tr>
+      <tr><td><code>addStake(uint32)</code></td><td><span class="tag tag-orange">Owner</span></td><td>Stake ETH with EntryPoint (required for paymasters)</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="token-config">paymasterData Layout</h3>
+  <p>The <code>paymasterData</code> field in the UserOperation is packed as:</p>
+
+  <table>
+    <thead><tr><th>Offset</th><th>Bytes</th><th>Field</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>20</td><td><code>token</code> &mdash; ERC-20 address (USDC/USDT)</td></tr>
+      <tr><td>20</td><td>6</td><td><code>validUntil</code> &mdash; uint48 expiry timestamp</td></tr>
+      <tr><td>26</td><td>6</td><td><code>validAfter</code> &mdash; uint48 earliest timestamp</td></tr>
+      <tr><td>32</td><td>65</td><td><code>signature</code> &mdash; ECDSA sig from verifyingSigner</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="bundlers">Bundlers</h2>
+
+  <div class="card-grid">
+    <div class="card">
+      <h4><span class="tag tag-purple">Pimlico</span> &mdash; 8 chains</h4>
+      <p style="color:var(--text-dim); font-size:0.92rem;">
+        Industry-standard ERC-4337 bundler. Handles UserOp submission, gas estimation, and ERC-20 paymaster
+        sponsorship for Ethereum, Base, Polygon, Celo, Arbitrum, Avalanche, BNB, and Berachain.
+      </p>
+      <p style="font-size:0.82rem;"><code>https://api.pimlico.io/v2/{chain}/rpc?apikey=KEY</code></p>
+    </div>
+    <div class="card">
+      <h4><span class="tag tag-green">Gelato</span> &mdash; Lisk</h4>
+      <p style="color:var(--text-dim); font-size:0.92rem;">
+        Bundler for Lisk (chain 1135). Supports EntryPoint v0.7, <code>eth_sendUserOperation</code>,
+        <code>eth_estimateUserOperationGas</code>, and <code>eth_supportedEntryPoints</code>.
+      </p>
+      <p style="font-size:0.82rem;"><code>https://api.gelato.cloud/rpc/1135?apiKey=KEY</code></p>
+    </div>
+  </div>
+
+  <h3 id="paymaster-flow">Paymaster Routing</h3>
+
+  <div class="flow">                   +------------------+
+                   |  <span class="hl">isLiskChain?</span>     |
+                   +--------+---------+
+                      No    |    Yes
+               +------------+----------------+
+               v                             v
+    +------------------+         +-----------------------+
+    | <span class="bl">Pimlico</span>            |         | <span class="gr">Custom LiskPaymaster</span>   |
+    | ----------------  |         | ---------------------  |
+    | Bundler: Pimlico  |         | Bundler: Gelato        |
+    | Paymaster: ERC-20 |         | Paymaster: Verifying   |
+    | Gas est: Pimlico  |         | Gas est: Lisk RPC      |
+    | Pricing: Pimlico  |         | Pricing: <span class="or">Enso API</span>      |
+    +------------------+         +-----------------------+
+               |                             |
+               +----------+--+------------- +
+                          v
+               <span class="hl">Same response to caller</span></div>
+
+  <h3 id="gas-pricing">Gas Pricing (Lisk)</h3>
+  <p>ETH price is fetched from the <strong>Enso API</strong> using <strong>Ethereum mainnet</strong> (chain ID 1) because Enso does not support the Lisk chain directly. We query the WETH price on mainnet &mdash; ETH price is the same regardless of chain:</p>
+  <pre><code>GET https://api.enso.build/api/v1/prices/1/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+Authorization: Bearer ENSO_API_KEY</code></pre>
+
+  <p>Token cost calculation (matches on-chain <code>getTokenCostForGas</code>):</p>
+  <pre><code><span class="s-comment">// tokenCost = gasCostWei * ethPriceUsd * 10^decimals * markup / (1e18 * 10000)</span>
+<span class="s-kw">const</span> pricePerEth = ethPriceUsd * <span class="s-num">10</span> ** tokenDecimals;  <span class="s-comment">// e.g. 2500 * 1e6</span>
+<span class="s-kw">const</span> tokenCost = gasCostWei * pricePerEth * markup / (<span class="s-num">1e18</span> * <span class="s-num">10000</span>);</code></pre>
+
+  <p>Gas fee estimation queries the Gelato bundler's minimum priority fee and the Lisk RPC gas price, takes the highest, then adds a 20% buffer:</p>
+  <pre><code><span class="s-comment">// Lisk gas fees (never fails -- aggressive fallbacks)</span>
+maxPriorityFeePerGas = <span class="s-fn">max</span>(rpcGasPrice, bundlerMinPriority, <span class="s-num">1_000_000</span>) * <span class="s-num">1.2</span>
+maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas</code></pre>
+
+  <h2 id="client-signing">V2 API &mdash; Client-Side Signing</h2>
+
+  <p>The V2 endpoints use a <strong>prepare &rarr; sign &rarr; submit</strong> pattern. The server builds the UserOperation and returns a hash. The client signs it locally. The server relays it to the bundler.</p>
+
+  <div class="callout">
+    <strong>Zero key exposure:</strong> The server never receives, stores, or processes any private key. It only needs the owner's public address to compute the deterministic Safe smart account.
+  </div>
+
+  <h3 id="prepare-endpoint">Prepare UserOperation</h3>
+
+  <div class="endpoint open">
+    <div class="endpoint-header" onclick="this.parentElement.classList.toggle('open')">
+      <span class="method method-post">POST</span>
+      <span class="endpoint-path">/api/v2/prepare</span>
+      <span class="endpoint-desc">Build unsigned UserOp, return hash to sign</span>
+    </div>
+    <div class="endpoint-body">
+
+      <h4>Request Body &mdash; Token Transfer</h4>
+      <pre><code>{
+  <span class="s-key">"ownerAddress"</span>: <span class="s-str">"0xYourEOAAddress"</span>,
+  <span class="s-key">"chainId"</span>: <span class="s-num">1135</span>,
+  <span class="s-key">"rpcUrl"</span>: <span class="s-str">"https://rpc.api.lisk.com"</span>,
+  <span class="s-key">"tokenAddress"</span>: <span class="s-str">"0xF242275d3a6527d877f2c927a82D9b057609cc71"</span>,
+  <span class="s-key">"recipient"</span>: <span class="s-str">"0xRecipientAddress"</span>,
+  <span class="s-key">"amount"</span>: <span class="s-num">5.0</span>
+}</code></pre>
+
+      <h4>Request Body &mdash; Universal Transaction</h4>
+      <pre><code>{
+  <span class="s-key">"ownerAddress"</span>: <span class="s-str">"0xYourEOAAddress"</span>,
+  <span class="s-key">"chainId"</span>: <span class="s-num">8453</span>,
+  <span class="s-key">"rpcUrl"</span>: <span class="s-str">"https://mainnet.base.org"</span>,
+  <span class="s-key">"calls"</span>: [
+    {
+      <span class="s-key">"to"</span>: <span class="s-str">"0xRecipientAddress"</span>,
+      <span class="s-key">"value"</span>: <span class="s-str">"1000000000000000000"</span>
+    }
+  ],
+  <span class="s-key">"paymasterToken"</span>: <span class="s-str">"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"</span>
+}</code></pre>
+
+      <h4>Parameters</h4>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>ownerAddress</code></td><td>address</td><td>Yes</td><td>EOA address (NOT private key)</td></tr>
+          <tr><td><code>chainId</code></td><td>number</td><td>Yes</td><td>Target chain ID</td></tr>
+          <tr><td><code>rpcUrl</code></td><td>string</td><td>Yes</td><td>Chain RPC endpoint</td></tr>
+          <tr><td><code>tokenAddress</code></td><td>address</td><td>Transfer mode</td><td>ERC-20 token to transfer</td></tr>
+          <tr><td><code>recipient</code></td><td>address</td><td>Transfer mode</td><td>Transfer recipient</td></tr>
+          <tr><td><code>amount</code></td><td>number</td><td>Transfer mode</td><td>Amount (human readable, e.g. <code>5.0</code>)</td></tr>
+          <tr><td><code>calls</code></td><td>array</td><td>Transaction mode</td><td>Array of calls (<code>to</code>, <code>value</code>, <code>data</code>, <code>abi</code>, ...)</td></tr>
+          <tr><td><code>paymasterToken</code></td><td>address</td><td>No</td><td>Token to pay gas with (for transaction mode)</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Response</h4>
+      <pre><code>{
+  <span class="s-key">"success"</span>: <span class="s-bool">true</span>,
+  <span class="s-key">"data"</span>: {
+    <span class="s-key">"smartAccountAddress"</span>: <span class="s-str">"0xYourSafeAddress"</span>,
+    <span class="s-key">"userOperation"</span>: {
+      <span class="s-key">"sender"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"nonce"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"callData"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"callGasLimit"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"verificationGasLimit"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"preVerificationGas"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"maxFeePerGas"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"maxPriorityFeePerGas"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"paymaster"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"paymasterData"</span>: <span class="s-str">"0x..."</span>,
+      <span class="s-key">"signature"</span>: <span class="s-str">"0x..."</span>
+    },
+    <span class="s-key">"hashToSign"</span>: <span class="s-str">"0xabcdef..."</span>,
+    <span class="s-key">"chainId"</span>: <span class="s-num">1135</span>
+  },
+  <span class="s-key">"message"</span>: <span class="s-str">"UserOperation prepared. Sign hashToSign with personal_sign..."</span>
+}</code></pre>
+    </div>
+  </div>
+
+  <h3 id="submit-endpoint">Submit Signed UserOperation</h3>
+
+  <div class="endpoint open">
+    <div class="endpoint-header" onclick="this.parentElement.classList.toggle('open')">
+      <span class="method method-post">POST</span>
+      <span class="endpoint-path">/api/v2/submit</span>
+      <span class="endpoint-desc">Relay signed UserOp to bundler</span>
+    </div>
+    <div class="endpoint-body">
+
+      <h4>Request Body</h4>
+      <pre><code>{
+  <span class="s-key">"chainId"</span>: <span class="s-num">1135</span>,
+  <span class="s-key">"userOperation"</span>: { <span class="s-comment">/* full userOperation from /api/v2/prepare */</span> },
+  <span class="s-key">"signature"</span>: <span class="s-str">"0x...your_personal_sign_result..."</span>
+}</code></pre>
+
+      <h4>Parameters</h4>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>chainId</code></td><td>number</td><td>Yes</td><td>Must match the chain from prepare</td></tr>
+          <tr><td><code>userOperation</code></td><td>object</td><td>Yes</td><td>Full UserOp object from prepare response</td></tr>
+          <tr><td><code>signature</code></td><td>hex string</td><td>Yes</td><td>65-byte ECDSA signature (<code>0x</code> + 130 hex chars)</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Response</h4>
+      <pre><code>{
+  <span class="s-key">"success"</span>: <span class="s-bool">true</span>,
+  <span class="s-key">"data"</span>: {
+    <span class="s-key">"userOperationHash"</span>: <span class="s-str">"0x1234..."</span>,
+    <span class="s-key">"chainId"</span>: <span class="s-num">1135</span>
+  },
+  <span class="s-key">"message"</span>: <span class="s-str">"UserOperation submitted successfully on chain 1135"</span>
+}</code></pre>
+
+      <p style="margin-top:12px;">The server encodes the signature in Safe format (adjusts <code>v</code> by +4 for the eth_sign path, prepends <code>validAfter=0</code> + <code>validUntil=0</code>) and sends to the bundler via <code>eth_sendUserOperation</code>.</p>
+    </div>
+  </div>
+
+  <!-- Bridging -->
+  <h2 id="bridging">Cross-Chain Bridging (Across Protocol)</h2>
+
+  <p>Bridge tokens between any supported chains using <strong>Across Protocol</strong>. The <code>/api/bridge</code> endpoint fetches a real-time quote from Across, builds the <code>approve + depositV3</code> calls, and executes them in a single UserOp. Gas is paid in the token being bridged.</p>
+
+  <div class="callout">
+    <strong>Supported routes:</strong> Bridging works on all Pimlico-supported chains (Ethereum, Base, Polygon, Celo, Arbitrum, Avalanche, BNB, Berachain). Lisk is not directly supported for bridging via the <code>/api/bridge</code> endpoint, but you can construct Across <code>depositV3</code> calls manually and submit them via <code>/api/v2/prepare</code>.
+  </div>
+
+  <div class="endpoint open">
+    <div class="endpoint-header" onclick="this.parentElement.classList.toggle('open')">
+      <span class="method method-post">POST</span>
+      <span class="endpoint-path">/api/bridge</span>
+      <span class="endpoint-desc">Bridge tokens cross-chain via Across</span>
+    </div>
+    <div class="endpoint-body">
+      <h4>Request Body</h4>
+      <pre><code>{
+  <span class="s-key">"privateKey"</span>: <span class="s-str">"0x..."</span>,
+  <span class="s-key">"sourceChainId"</span>: <span class="s-num">137</span>,
+  <span class="s-key">"destChainId"</span>: <span class="s-num">42161</span>,
+  <span class="s-key">"rpcUrl"</span>: <span class="s-str">"https://polygon-rpc.com"</span>,
+  <span class="s-key">"tokenAddress"</span>: <span class="s-str">"0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"</span>,
+  <span class="s-key">"amount"</span>: <span class="s-num">50.0</span>,
+  <span class="s-key">"recipient"</span>: <span class="s-str">"0xRecipientOnDestChain"</span>
+}</code></pre>
+      <h4>Parameters</h4>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>privateKey</code></td><td>hex</td><td>Yes</td><td>Owner's private key (v1 endpoint)</td></tr>
+          <tr><td><code>sourceChainId</code></td><td>number</td><td>Yes</td><td>Source chain ID</td></tr>
+          <tr><td><code>destChainId</code></td><td>number</td><td>Yes</td><td>Destination chain ID</td></tr>
+          <tr><td><code>rpcUrl</code></td><td>string</td><td>Yes</td><td>Source chain RPC</td></tr>
+          <tr><td><code>tokenAddress</code></td><td>address</td><td>Yes</td><td>Token to bridge (USDC, USDT)</td></tr>
+          <tr><td><code>amount</code></td><td>number</td><td>Yes</td><td>Amount (human-readable)</td></tr>
+          <tr><td><code>recipient</code></td><td>address</td><td>No</td><td>Recipient on dest chain (defaults to same smart account)</td></tr>
+        </tbody>
+      </table>
+      <h4>Response</h4>
+      <pre><code>{
+  <span class="s-key">"success"</span>: <span class="s-bool">true</span>,
+  <span class="s-key">"data"</span>: {
+    <span class="s-key">"transactionHash"</span>: <span class="s-str">"0x..."</span>,
+    <span class="s-key">"sourceChainId"</span>: <span class="s-num">137</span>,
+    <span class="s-key">"destChainId"</span>: <span class="s-num">42161</span>,
+    <span class="s-key">"estimatedFillTime"</span>: <span class="s-str">"~2-5 minutes"</span>
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <!-- Signing Guide / Wallet Integrations -->
+  <h2 id="signing-guide">Wallet Integrations &amp; Signing</h2>
+
+  <p>The <code>hashToSign</code> from <code>/api/v2/prepare</code> is the <strong>Safe operation hash</strong> (EIP-712). Sign it with <code>personal_sign</code> using any wallet:</p>
+
+  <div class="callout callout-warning">
+    <strong>Important:</strong> Use <code>personal_sign</code> (EIP-191), not <code>eth_sign</code>. The Safe4337Module expects the <code>\x19Ethereum Signed Message:\n32</code> prefix. The server adjusts <code>v</code> (+4) for Safe's eth_sign verification path.
+  </div>
+
+  <h3 id="privy">Privy</h3>
+  <p>Privy embedded wallets work seamlessly. Use the <code>useSignMessage</code> hook:</p>
+
+  <h4 style="margin-top:1rem; font-family:var(--font-hand); font-size:1.3rem; color:var(--ink-blue);">Token Transfer</h4>
+  <pre><code><span class="s-kw">import</span> { usePrivy, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'@privy-io/react-auth'</span>;
+
+<span class="s-kw">function</span> <span class="s-fn">GaslessTransfer</span>() {
+  <span class="s-kw">const</span> { user } = <span class="s-fn">usePrivy</span>();
+  <span class="s-kw">const</span> { signMessage } = <span class="s-fn">useSignMessage</span>();
+  <span class="s-kw">const</span> address = user?.wallet?.address;
+
+  <span class="s-kw">async function</span> <span class="s-fn">send</span>() {
+    <span class="s-comment">// Step 1: Prepare (send EOA address, NOT private key)</span>
+    <span class="s-kw">const</span> res = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/prepare'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({
+        ownerAddress: address,
+        chainId: <span class="s-num">137</span>,
+        rpcUrl: <span class="s-str">'https://polygon-rpc.com'</span>,
+        tokenAddress: <span class="s-str">'0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'</span>,
+        recipient: <span class="s-str">'0xRecipient'</span>,
+        amount: <span class="s-num">5.0</span>,
+      }),
+    });
+    <span class="s-kw">const</span> { data } = <span class="s-kw">await</span> res.<span class="s-fn">json</span>();
+
+    <span class="s-comment">// Step 2: Sign with Privy embedded wallet</span>
+    <span class="s-kw">const</span> signature = <span class="s-kw">await</span> <span class="s-fn">signMessage</span>(data.hashToSign);
+
+    <span class="s-comment">// Step 3: Submit</span>
+    <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/submit'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">137</span>, userOperation: data.userOperation, signature }),
+    });
+  }
+}</code></pre>
+
+  <h4 style="margin-top:1rem; font-family:var(--font-hand); font-size:1.3rem; color:var(--ink-blue);">ERC-20 Approve (any contract call)</h4>
+  <pre><code><span class="s-kw">import</span> { usePrivy, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'@privy-io/react-auth'</span>;
+
+<span class="s-kw">function</span> <span class="s-fn">GaslessApprove</span>() {
+  <span class="s-kw">const</span> { user } = <span class="s-fn">usePrivy</span>();
+  <span class="s-kw">const</span> { signMessage } = <span class="s-fn">useSignMessage</span>();
+  <span class="s-kw">const</span> address = user?.wallet?.address;
+
+  <span class="s-kw">async function</span> <span class="s-fn">approveToken</span>(spender, amount) {
+    <span class="s-comment">// Use "calls" instead of tokenAddress/recipient/amount</span>
+    <span class="s-kw">const</span> res = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/prepare'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({
+        ownerAddress: address,
+        chainId: <span class="s-num">1135</span>,
+        rpcUrl: <span class="s-str">'https://rpc.api.lisk.com'</span>,
+        calls: [{
+          to: <span class="s-str">'0xF242275d3a6527d877f2c927a82D9b057609cc71'</span>, <span class="s-comment">// Bridged USDC on Lisk</span>
+          abi: [<span class="s-str">'function approve(address spender, uint256 amount)'</span>],
+          functionName: <span class="s-str">'approve'</span>,
+          args: [spender, amount],
+        }],
+        paymasterToken: <span class="s-str">'0xF242275d3a6527d877f2c927a82D9b057609cc71'</span>,
+      }),
+    });
+    <span class="s-kw">const</span> { data } = <span class="s-kw">await</span> res.<span class="s-fn">json</span>();
+
+    <span class="s-comment">// Sign with Privy</span>
+    <span class="s-kw">const</span> signature = <span class="s-kw">await</span> <span class="s-fn">signMessage</span>(data.hashToSign);
+
+    <span class="s-comment">// Submit</span>
+    <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/submit'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">1135</span>, userOperation: data.userOperation, signature }),
+    });
+  }
+
+  <span class="s-kw">return</span> (
+    &lt;button onClick={() =&gt; <span class="s-fn">approveToken</span>(<span class="s-str">'0xDEXRouter'</span>, <span class="s-str">'1000000'</span>)}&gt;
+      Approve USDC
+    &lt;/button&gt;
+  );
+}</code></pre>
+
+  <h3 id="wagmi">wagmi / RainbowKit / ConnectKit</h3>
+  <p>Works with any wagmi-compatible wallet (MetaMask, WalletConnect, Coinbase Wallet, etc.):</p>
+  <pre><code><span class="s-kw">import</span> { useAccount, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'wagmi'</span>;
+<span class="s-kw">import</span> { toBytes } <span class="s-kw">from</span> <span class="s-str">'viem'</span>;
+
+<span class="s-kw">function</span> <span class="s-fn">GaslessAction</span>() {
+  <span class="s-kw">const</span> { address } = <span class="s-fn">useAccount</span>();
+  <span class="s-kw">const</span> { signMessageAsync } = <span class="s-fn">useSignMessage</span>();
+
+  <span class="s-kw">async function</span> <span class="s-fn">execute</span>() {
+    <span class="s-comment">// Prepare — works for transfers, approvals, any contract call</span>
+    <span class="s-kw">const</span> res = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/prepare'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({
+        ownerAddress: address,
+        chainId: <span class="s-num">8453</span>,
+        rpcUrl: <span class="s-str">'https://mainnet.base.org'</span>,
+        calls: [{ to: <span class="s-str">'0xContract'</span>, data: <span class="s-str">'0x...'</span> }],
+        paymasterToken: <span class="s-str">'0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'</span>,
+      }),
+    });
+    <span class="s-kw">const</span> { data } = <span class="s-kw">await</span> res.<span class="s-fn">json</span>();
+
+    <span class="s-comment">// Sign with connected wallet (MetaMask, WalletConnect, etc.)</span>
+    <span class="s-kw">const</span> signature = <span class="s-kw">await</span> <span class="s-fn">signMessageAsync</span>({
+      message: { raw: <span class="s-fn">toBytes</span>(data.hashToSign) },
+    });
+
+    <span class="s-comment">// Submit</span>
+    <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/submit'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">8453</span>, userOperation: data.userOperation, signature }),
+    });
+  }
+}</code></pre>
+
+  <h3 id="server-side">Server-Side Signing (ethers.js)</h3>
+  <p>For backend services, bots, or automation &mdash; generate or use a private key server-side:</p>
+  <pre><code><span class="s-kw">import</span> { ethers } <span class="s-kw">from</span> <span class="s-str">'ethers'</span>;
+
+<span class="s-comment">// Generate a new wallet (or use existing key)</span>
+<span class="s-kw">const</span> wallet = ethers.Wallet.<span class="s-fn">createRandom</span>();
+<span class="s-comment">// Or: const wallet = new ethers.Wallet('0xYourPrivateKey');</span>
+
+console.<span class="s-fn">log</span>(<span class="s-str">'EOA:'</span>, wallet.address);  <span class="s-comment">// save this</span>
+console.<span class="s-fn">log</span>(<span class="s-str">'Key:'</span>, wallet.privateKey); <span class="s-comment">// store securely!</span>
+
+<span class="s-comment">// Prepare any transaction</span>
+<span class="s-kw">const</span> prepareRes = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/prepare'</span>, {
+  method: <span class="s-str">'POST'</span>,
+  headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+  body: JSON.<span class="s-fn">stringify</span>({
+    ownerAddress: wallet.address,
+    chainId: <span class="s-num">1135</span>,
+    rpcUrl: <span class="s-str">'https://rpc.api.lisk.com'</span>,
+    tokenAddress: <span class="s-str">'0xF242275d3a6527d877f2c927a82D9b057609cc71'</span>,
+    recipient: <span class="s-str">'0xRecipient'</span>,
+    amount: <span class="s-num">10.0</span>,
+  }),
+});
+<span class="s-kw">const</span> { data } = <span class="s-kw">await</span> prepareRes.<span class="s-fn">json</span>();
+
+<span class="s-comment">// Sign locally</span>
+<span class="s-kw">const</span> signature = <span class="s-kw">await</span> wallet.<span class="s-fn">signMessage</span>(ethers.utils.<span class="s-fn">arrayify</span>(data.hashToSign));
+
+<span class="s-comment">// Submit</span>
+<span class="s-kw">const</span> result = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/submit'</span>, {
+  method: <span class="s-str">'POST'</span>,
+  headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+  body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">1135</span>, userOperation: data.userOperation, signature }),
+}).<span class="s-fn">then</span>(r => r.<span class="s-fn">json</span>());
+
+console.<span class="s-fn">log</span>(<span class="s-str">'UserOp:'</span>, result.data.userOperationHash);</code></pre>
+
+  <h4>MetaMask / Browser <code>window.ethereum</code></h4>
+  <pre><code><span class="s-kw">const</span> signature = <span class="s-kw">await</span> window.ethereum.<span class="s-fn">request</span>({
+  method: <span class="s-str">'personal_sign'</span>,
+  params: [hashToSign, ownerAddress],
+});</code></pre>
+
+  <h4>viem (standalone)</h4>
+  <pre><code><span class="s-kw">import</span> { privateKeyToAccount } <span class="s-kw">from</span> <span class="s-str">'viem/accounts'</span>;
+<span class="s-kw">const</span> account = <span class="s-fn">privateKeyToAccount</span>(privateKey);
+<span class="s-kw">const</span> signature = <span class="s-kw">await</span> account.<span class="s-fn">signMessage</span>({ message: { raw: hashToSign } });</code></pre>
+
+  <!-- Examples -->
+  <h2 id="example-transfer">Examples</h2>
+
+  <h3>Token Transfer</h3>
+  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ownerAddress": "0xYourEOA",
+    "chainId": 1135,
+    "rpcUrl": "https://rpc.api.lisk.com",
+    "tokenAddress": "0xF242275d3a6527d877f2c927a82D9b057609cc71",
+    "recipient": "0xRecipient",
+    "amount": 5.0
+  }'</code></pre>
+
+  <h3 id="example-approve">ERC-20 Approve (any chain including Lisk)</h3>
+  <p>Approve a contract to spend tokens on your behalf. Works on all chains:</p>
+  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ownerAddress": "0xYourEOA",
+    "chainId": 1135,
+    "rpcUrl": "https://rpc.api.lisk.com",
+    "calls": [
+      {
+        "to": "0xF242275d3a6527d877f2c927a82D9b057609cc71",
+        "abi": ["function approve(address spender, uint256 amount)"],
+        "functionName": "approve",
+        "args": ["0xSpenderContract", "1000000000"]
+      }
+    ],
+    "paymasterToken": "0xF242275d3a6527d877f2c927a82D9b057609cc71"
+  }'</code></pre>
+
+  <h3 id="example-multicall">Multi-Call: Approve + Swap (single UserOp)</h3>
+  <p>Execute multiple contract calls atomically in one transaction:</p>
+  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ownerAddress": "0xYourEOA",
+    "chainId": 8453,
+    "rpcUrl": "https://mainnet.base.org",
+    "calls": [
+      {
+        "to": "0xTokenAddress",
+        "abi": ["function approve(address,uint256)"],
+        "functionName": "approve",
+        "args": ["0xDEXRouter", "1000000"]
+      },
+      {
+        "to": "0xDEXRouter",
+        "data": "0x...encoded swap calldata..."
+      }
+    ],
+    "paymasterToken": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+  }'</code></pre>
+
+  <h3>Raw Calldata (any contract interaction)</h3>
+  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ownerAddress": "0xYourEOA",
+    "chainId": 1135,
+    "rpcUrl": "https://rpc.api.lisk.com",
+    "calls": [
+      {
+        "to": "0xAnyContract",
+        "data": "0xabcdef...raw calldata...",
+        "value": "0"
+      }
+    ],
+    "paymasterToken": "0xF242275d3a6527d877f2c927a82D9b057609cc71"
+  }'</code></pre>
+
+  <h3 id="example-bridge">Cross-Chain Bridge (Across Protocol)</h3>
+  <p>Bridge USDC from Polygon to Arbitrum:</p>
+  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/bridge \
+  -H "Content-Type: application/json" \
+  -d '{
+    "privateKey": "0x...",
+    "sourceChainId": 137,
+    "destChainId": 42161,
+    "rpcUrl": "https://polygon-rpc.com",
+    "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    "amount": 50.0
+  }'</code></pre>
+
+  <!-- LLM / AI Usage -->
+  <h2 id="llm-usage">Use with Claude / LLMs</h2>
+
+  <p>You can give Claude (or any LLM) the API reference file so it can build transactions for you. Download the markdown file and include it in your prompt context:</p>
+
+  <p><a href="api-reference.md" download style="display:inline-block; padding:0.5rem 1.25rem; border:1px dashed var(--border); border-radius:var(--radius); text-decoration:none; color:var(--ink); font-family:var(--font-hand); font-size:1.15rem; font-weight:600; background:var(--highlight);">Download api-reference.md</a></p>
+
+  <h4>How to use with Claude</h4>
+  <pre><code><span class="s-comment"># In your Claude prompt / system prompt, include:</span>
+
+You have access to the Light Infra API. Here is the API reference:
+
+&lt;api-reference&gt;
+{paste contents of api-reference.md}
+&lt;/api-reference&gt;
+
+Use the /api/v2/prepare and /api/v2/submit endpoints to build
+gasless transactions. The user will sign the hashToSign locally.</code></pre>
+
+  <h4>Example Claude interaction</h4>
+  <pre><code><span class="s-comment">User:</span> Send 10 USDC to 0xBob on Polygon, my address is 0xAlice
+
+<span class="s-comment">Claude:</span> I'll prepare a gasless USDC transfer for you.
+
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ownerAddress": "0xAlice",
+    "chainId": 137,
+    "rpcUrl": "https://polygon-rpc.com",
+    "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+    "recipient": "0xBob",
+    "amount": 10.0
+  }'
+
+<span class="s-comment">Sign the hashToSign from the response, then submit:</span>
+
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/submit ...</code></pre>
+
+  <div class="callout">
+    <strong>Tip:</strong> The <code>.md</code> format works best for LLM context. You can also paste the file contents directly into the system prompt for tools like Claude Code, Cursor, or Windsurf.
+  </div>
+
+  <footer>
+    Built with ERC-4337 &middot; Safe v1.4.1 &middot; Pimlico &middot; Gelato &middot; Across &middot; Enso
+  </footer>
+
+</div>
+
+<script>
+  function toggleTheme() {
+    const html = document.documentElement;
+    const current = html.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    html.setAttribute('data-theme', next);
+    document.querySelector('.theme-label').textContent = next === 'dark' ? 'Light' : 'Dark';
+    localStorage.setItem('lightinfra-theme', next);
+  }
+
+  const saved = localStorage.getItem('lightinfra-theme');
+  if (saved) {
+    document.documentElement.setAttribute('data-theme', saved);
+    document.querySelector('.theme-label').textContent = saved === 'dark' ? 'Light' : 'Dark';
+  }
+
+  const sections = document.querySelectorAll('h2[id], h3[id]');
+  const navLinks = document.querySelectorAll('.sidebar nav a');
+
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        navLinks.forEach(link => link.classList.remove('active'));
+        const activeLink = document.querySelector(`.sidebar nav a[href="#${entry.target.id}"]`);
+        if (activeLink) activeLink.classList.add('active');
+      }
+    });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+
+  sections.forEach(section => observer.observe(section));
+
+  document.querySelectorAll('.sidebar a').forEach(link => {
+    link.addEventListener('click', () => {
+      document.querySelector('.sidebar').classList.remove('open');
+    });
+  });
+
+  // Wrap tables for mobile horizontal scroll
+  document.querySelectorAll('.main table').forEach(table => {
+    if (!table.parentElement.classList.contains('table-wrap')) {
+      const wrap = document.createElement('div');
+      wrap.className = 'table-wrap';
+      table.parentNode.insertBefore(wrap, table);
+      wrap.appendChild(table);
+    }
+  });
+
+  // Copy buttons on all code blocks
+  document.querySelectorAll('pre').forEach(pre => {
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'copy';
+    btn.addEventListener('click', () => {
+      const code = pre.querySelector('code');
+      const text = (code || pre).textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = 'copied!';
+        btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1500);
+      });
+    });
+    pre.appendChild(btn);
+  });
+</script>
+
+</body>
+</html>

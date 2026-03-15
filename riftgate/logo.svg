@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <defs>
+    <filter id="rough">
+      <feTurbulence type="turbulence" baseFrequency="0.035" numOctaves="4" result="noise"/>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="1.5" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+  <!-- lightbulb outline -->
+  <path d="M 60 18 C 40 18 28 32 28 48 C 28 60 36 68 42 76 L 42 88 L 78 88 L 78 76 C 84 68 92 60 92 48 C 92 32 80 18 60 18 Z" fill="none" stroke="#1a1610" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" filter="url(#rough)"/>
+  <!-- bulb base lines -->
+  <line x1="44" y1="92" x2="76" y2="92" stroke="#1a1610" stroke-width="1.8" stroke-linecap="round" filter="url(#rough)"/>
+  <line x1="46" y1="96" x2="74" y2="96" stroke="#1a1610" stroke-width="1.8" stroke-linecap="round" filter="url(#rough)"/>
+  <line x1="50" y1="100" x2="70" y2="100" stroke="#1a1610" stroke-width="1.5" stroke-linecap="round" filter="url(#rough)"/>
+  <!-- filament -->
+  <path d="M 50 76 L 50 56 Q 55 44 60 56 Q 65 44 70 56 L 70 76" fill="none" stroke="#1a1610" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" filter="url(#rough)"/>
+  <!-- light rays -->
+  <line x1="60" y1="8" x2="60" y2="14" stroke="#1a1610" stroke-width="1.2" stroke-linecap="round" opacity="0.5" filter="url(#rough)"/>
+  <line x1="30" y1="18" x2="34" y2="23" stroke="#1a1610" stroke-width="1.2" stroke-linecap="round" opacity="0.5" filter="url(#rough)"/>
+  <line x1="90" y1="18" x2="86" y2="23" stroke="#1a1610" stroke-width="1.2" stroke-linecap="round" opacity="0.5" filter="url(#rough)"/>
+  <line x1="18" y1="48" x2="24" y2="48" stroke="#1a1610" stroke-width="1.2" stroke-linecap="round" opacity="0.5" filter="url(#rough)"/>
+  <line x1="96" y1="48" x2="102" y2="48" stroke="#1a1610" stroke-width="1.2" stroke-linecap="round" opacity="0.5" filter="url(#rough)"/>
+</svg>

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
+import { prepareTransfer, prepareTransaction, submitSignedUserOp } from './relay';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
 import { pairAndApprove, disconnectSession, getActiveSessions, getPendingRequests, approveRequest, rejectRequest } from './walletconnect';
 import { 
@@ -1161,6 +1162,212 @@ router.post('/api/walletconnect/requests/:id/reject', checkRateLimit, async (req
       success: false,
       error: error.message?.includes('No pending request') ? 'Not Found' : 'Internal Server Error',
       message: error?.message || 'Failed to reject request',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// ==================== V2 CLIENT-SIDE SIGNING ENDPOINTS ====================
+
+// Prepare a UserOperation for client-side signing (no private key needed)
+router.post('/api/v2/prepare', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      ownerAddress,
+      chainId,
+      rpcUrl,
+      // Transfer-specific fields
+      tokenAddress,
+      recipient,
+      amount,
+      // Transaction-specific fields
+      calls,
+      paymasterToken,
+    } = req.body;
+
+    // Validate required fields
+    if (!ownerAddress || !chainId || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Required fields: ownerAddress, chainId, rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (!ethers.utils.isAddress(ownerAddress)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid ownerAddress format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Get chain config
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (!chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster config for chain ${chainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    let result;
+
+    if (tokenAddress && recipient && amount) {
+      // Simple transfer mode
+      if (!ethers.utils.isAddress(tokenAddress) || !ethers.utils.isAddress(recipient)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid tokenAddress or recipient format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      console.log(`🔧 [v2] Preparing transfer on chain ${chainId}: ${amount} of ${tokenAddress} → ${recipient}`);
+
+      result = await paymasterCircuitBreaker.execute(() =>
+        prepareTransfer({
+          ownerAddress,
+          chainId,
+          rpcUrl,
+          tokenAddress,
+          recipient,
+          amount,
+          bundlerUrl: chainConfig.bundlerUrl,
+          paymasterRPC: chainConfig.paymasterRPC,
+        })
+      );
+    } else if (calls && Array.isArray(calls) && calls.length > 0) {
+      // Universal transaction mode
+      for (let i = 0; i < calls.length; i++) {
+        if (!calls[i]?.to || !ethers.utils.isAddress(calls[i].to)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Validation Error',
+            message: `Invalid 'to' address in call ${i}`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      console.log(`🔧 [v2] Preparing transaction on chain ${chainId}: ${calls.length} calls`);
+
+      result = await paymasterCircuitBreaker.execute(() =>
+        prepareTransaction({
+          ownerAddress,
+          chainId,
+          rpcUrl,
+          calls,
+          bundlerUrl: chainConfig.bundlerUrl,
+          paymasterRPC: chainConfig.paymasterRPC,
+          paymasterToken,
+        })
+      );
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Provide either (tokenAddress + recipient + amount) for a transfer, or (calls) for a transaction',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        smartAccountAddress: result.smartAccountAddress,
+        userOperation: result.userOperation,
+        hashToSign: result.hashToSign,
+        chainId: result.chainId,
+      },
+      message: 'UserOperation prepared. Sign hashToSign with personal_sign and submit to /api/v2/submit',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[v2] Prepare error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Prepare Failed',
+      message: error?.message || 'Failed to prepare UserOperation',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// Submit a client-signed UserOperation
+router.post('/api/v2/submit', checkRateLimit, async (req, res) => {
+  try {
+    const { chainId, userOperation, signature } = req.body;
+
+    if (!chainId || !userOperation || !signature) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Required fields: chainId, userOperation, signature',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Validate signature format (65 bytes = 0x + 130 hex chars)
+    if (typeof signature !== 'string' || !signature.startsWith('0x') || signature.length !== 132) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Signature must be a 65-byte hex string (0x + 130 chars)',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    console.log(`📤 [v2] Submitting signed UserOp on chain ${chainId}`);
+
+    const result = await paymasterCircuitBreaker.execute(() =>
+      submitSignedUserOp({
+        chainId,
+        userOperation,
+        signature: signature as `0x${string}`,
+        bundlerUrl: chainConfig.bundlerUrl,
+      })
+    );
+
+    res.json({
+      success: true,
+      data: {
+        userOperationHash: result.userOperationHash,
+        chainId,
+      },
+      message: `UserOperation submitted successfully on chain ${chainId}`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[v2] Submit error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Submit Failed',
+      message: error?.message || 'Failed to submit UserOperation',
       timestamp: new Date().toISOString(),
     });
   }

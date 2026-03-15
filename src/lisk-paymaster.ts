@@ -50,8 +50,9 @@ const SUPPORTED_TOKEN_ADDRESSES = new Set(
 /** Enso API key for price fetches */
 const ENSO_API_KEY = process.env.ENSO_API_KEY || "";
 
-/** WETH address on Lisk (used to fetch ETH price from Enso) */
-const LISK_WETH = "0x4200000000000000000000000000000000000006";
+/** WETH address on Ethereum mainnet (used to fetch ETH price from Enso — Lisk chain not supported by Enso) */
+const ETH_MAINNET_WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+const ETH_MAINNET_CHAIN_ID = 1;
 
 /** Cached ETH price — refreshed via fetchEthPrice() */
 let ethPriceUsd = Number(process.env.LISK_ETH_PRICE_USD) || 2500;
@@ -100,7 +101,7 @@ export async function fetchEthPrice(): Promise<number> {
 
   try {
     const res = await fetch(
-      `https://api.enso.build/api/v1/prices/${LISK_CHAIN_ID}/${LISK_WETH}`,
+      `https://api.enso.build/api/v1/prices/${ETH_MAINNET_CHAIN_ID}/${ETH_MAINNET_WETH}`,
       { headers: { Authorization: `Bearer ${ENSO_API_KEY}` } }
     );
 
