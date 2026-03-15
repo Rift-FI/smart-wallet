@@ -908,22 +908,22 @@ maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas
   <!-- Bridging -->
   <h2 id="bridging">Cross-Chain Bridging (Across Protocol)</h2>
 
-  <p>Bridge tokens between any supported chains using <strong>Across Protocol</strong>. The <code>/api/bridge</code> endpoint fetches a real-time quote from Across, builds the <code>approve + depositV3</code> calls, and executes them in a single UserOp. Gas is paid in the token being bridged.</p>
+  <p>Bridge tokens between any supported chains using <strong>Across Protocol</strong>. The V2 bridge endpoint uses the same <strong>prepare &rarr; sign &rarr; submit</strong> flow &mdash; no private key needed. The server fetches an Across quote, builds the <code>approve + depositV3</code> calls, and returns a UserOp for you to sign. Gas is paid in the token being bridged.</p>
 
   <div class="callout">
-    <strong>Supported routes:</strong> Bridging works on all Pimlico-supported chains (Ethereum, Base, Polygon, Celo, Arbitrum, Avalanche, BNB, Berachain). Lisk is not directly supported for bridging via the <code>/api/bridge</code> endpoint, but you can construct Across <code>depositV3</code> calls manually and submit them via <code>/api/v2/prepare</code>.
+    <strong>Supported routes:</strong> Bridging works on all Pimlico-supported chains (Ethereum, Base, Polygon, Celo, Arbitrum, Avalanche, BNB, Berachain). Lisk bridging is not directly supported via Across but you can construct <code>depositV3</code> calls manually via <code>/api/v2/prepare</code>.
   </div>
 
   <div class="endpoint open">
     <div class="endpoint-header" onclick="this.parentElement.classList.toggle('open')">
       <span class="method method-post">POST</span>
-      <span class="endpoint-path">/api/bridge</span>
-      <span class="endpoint-desc">Bridge tokens cross-chain via Across</span>
+      <span class="endpoint-path">/api/v2/bridge</span>
+      <span class="endpoint-desc">Prepare a cross-chain bridge (client-side signing)</span>
     </div>
     <div class="endpoint-body">
       <h4>Request Body</h4>
       <pre><code>{
-  <span class="s-key">"privateKey"</span>: <span class="s-str">"0x..."</span>,
+  <span class="s-key">"ownerAddress"</span>: <span class="s-str">"0xYourEOAAddress"</span>,
   <span class="s-key">"sourceChainId"</span>: <span class="s-num">137</span>,
   <span class="s-key">"destChainId"</span>: <span class="s-num">42161</span>,
   <span class="s-key">"rpcUrl"</span>: <span class="s-str">"https://polygon-rpc.com"</span>,
@@ -935,7 +935,7 @@ maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>privateKey</code></td><td>hex</td><td>Yes</td><td>Owner's private key (v1 endpoint)</td></tr>
+          <tr><td><code>ownerAddress</code></td><td>address</td><td>Yes</td><td>EOA address (NOT private key)</td></tr>
           <tr><td><code>sourceChainId</code></td><td>number</td><td>Yes</td><td>Source chain ID</td></tr>
           <tr><td><code>destChainId</code></td><td>number</td><td>Yes</td><td>Destination chain ID</td></tr>
           <tr><td><code>rpcUrl</code></td><td>string</td><td>Yes</td><td>Source chain RPC</td></tr>
@@ -948,12 +948,22 @@ maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas
       <pre><code>{
   <span class="s-key">"success"</span>: <span class="s-bool">true</span>,
   <span class="s-key">"data"</span>: {
-    <span class="s-key">"transactionHash"</span>: <span class="s-str">"0x..."</span>,
-    <span class="s-key">"sourceChainId"</span>: <span class="s-num">137</span>,
-    <span class="s-key">"destChainId"</span>: <span class="s-num">42161</span>,
-    <span class="s-key">"estimatedFillTime"</span>: <span class="s-str">"~2-5 minutes"</span>
-  }
+    <span class="s-key">"smartAccountAddress"</span>: <span class="s-str">"0x..."</span>,
+    <span class="s-key">"userOperation"</span>: { <span class="s-comment">/* ...full UserOp... */</span> },
+    <span class="s-key">"hashToSign"</span>: <span class="s-str">"0xabcdef..."</span>,
+    <span class="s-key">"chainId"</span>: <span class="s-num">137</span>,
+    <span class="s-key">"bridge"</span>: {
+      <span class="s-key">"sourceChainId"</span>: <span class="s-num">137</span>,
+      <span class="s-key">"destChainId"</span>: <span class="s-num">42161</span>,
+      <span class="s-key">"inputAmount"</span>: <span class="s-str">"50.0"</span>,
+      <span class="s-key">"outputAmount"</span>: <span class="s-str">"49.85"</span>,
+      <span class="s-key">"fee"</span>: <span class="s-str">"0.15"</span>,
+      <span class="s-key">"estimatedFillTime"</span>: <span class="s-str">"~2-5 minutes"</span>
+    }
+  },
+  <span class="s-key">"message"</span>: <span class="s-str">"Sign hashToSign and submit to /api/v2/submit"</span>
 }</code></pre>
+      <p>Sign the <code>hashToSign</code> and submit via <code>POST /api/v2/submit</code> &mdash; same as any other v2 operation.</p>
     </div>
   </div>
 
@@ -1051,6 +1061,42 @@ maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas
   );
 }</code></pre>
 
+  <h4 style="margin-top:1rem; font-family:var(--font-hand); font-size:1.3rem; color:var(--ink-blue);">Cross-Chain Bridge</h4>
+  <pre><code><span class="s-kw">import</span> { usePrivy, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'@privy-io/react-auth'</span>;
+
+<span class="s-kw">function</span> <span class="s-fn">GaslessBridge</span>() {
+  <span class="s-kw">const</span> { user } = <span class="s-fn">usePrivy</span>();
+  <span class="s-kw">const</span> { signMessage } = <span class="s-fn">useSignMessage</span>();
+  <span class="s-kw">const</span> address = user?.wallet?.address;
+
+  <span class="s-kw">async function</span> <span class="s-fn">bridge</span>() {
+    <span class="s-comment">// Step 1: Prepare bridge UserOp</span>
+    <span class="s-kw">const</span> res = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/bridge'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({
+        ownerAddress: address,
+        sourceChainId: <span class="s-num">137</span>,
+        destChainId: <span class="s-num">42161</span>,
+        rpcUrl: <span class="s-str">'https://polygon-rpc.com'</span>,
+        tokenAddress: <span class="s-str">'0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'</span>,
+        amount: <span class="s-num">25.0</span>,
+      }),
+    });
+    <span class="s-kw">const</span> { data } = <span class="s-kw">await</span> res.<span class="s-fn">json</span>();
+
+    <span class="s-comment">// Step 2: Sign with Privy embedded wallet</span>
+    <span class="s-kw">const</span> signature = <span class="s-kw">await</span> <span class="s-fn">signMessage</span>(data.hashToSign);
+
+    <span class="s-comment">// Step 3: Submit</span>
+    <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/submit'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">137</span>, userOperation: data.userOperation, signature }),
+    });
+  }
+}</code></pre>
+
   <h3 id="wagmi">wagmi / RainbowKit / ConnectKit</h3>
   <p>Works with any wagmi-compatible wallet (MetaMask, WalletConnect, Coinbase Wallet, etc.):</p>
   <pre><code><span class="s-kw">import</span> { useAccount, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'wagmi'</span>;
@@ -1082,6 +1128,44 @@ maxFeePerGas = rpcGasPrice * <span class="s-num">3</span> + maxPriorityFeePerGas
 
     <span class="s-comment">// Submit</span>
     <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'/api/v2/submit'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">8453</span>, userOperation: data.userOperation, signature }),
+    });
+  }
+}</code></pre>
+
+  <h4 style="margin-top:1rem; font-family:var(--font-hand); font-size:1.3rem; color:var(--ink-blue);">Cross-Chain Bridge</h4>
+  <pre><code><span class="s-kw">import</span> { useAccount, useSignMessage } <span class="s-kw">from</span> <span class="s-str">'wagmi'</span>;
+<span class="s-kw">import</span> { toBytes } <span class="s-kw">from</span> <span class="s-str">'viem'</span>;
+
+<span class="s-kw">function</span> <span class="s-fn">GaslessBridge</span>() {
+  <span class="s-kw">const</span> { address } = <span class="s-fn">useAccount</span>();
+  <span class="s-kw">const</span> { signMessageAsync } = <span class="s-fn">useSignMessage</span>();
+
+  <span class="s-kw">async function</span> <span class="s-fn">bridge</span>() {
+    <span class="s-comment">// Step 1: Prepare bridge UserOp</span>
+    <span class="s-kw">const</span> res = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/bridge'</span>, {
+      method: <span class="s-str">'POST'</span>,
+      headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+      body: JSON.<span class="s-fn">stringify</span>({
+        ownerAddress: address,
+        sourceChainId: <span class="s-num">8453</span>,
+        destChainId: <span class="s-num">42161</span>,
+        rpcUrl: <span class="s-str">'https://mainnet.base.org'</span>,
+        tokenAddress: <span class="s-str">'0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'</span>,
+        amount: <span class="s-num">100.0</span>,
+      }),
+    });
+    <span class="s-kw">const</span> { data } = <span class="s-kw">await</span> res.<span class="s-fn">json</span>();
+
+    <span class="s-comment">// Step 2: Sign with connected wallet (MetaMask, WalletConnect, etc.)</span>
+    <span class="s-kw">const</span> signature = <span class="s-kw">await</span> <span class="s-fn">signMessageAsync</span>({
+      message: { raw: <span class="s-fn">toBytes</span>(data.hashToSign) },
+    });
+
+    <span class="s-comment">// Step 3: Submit</span>
+    <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/submit'</span>, {
       method: <span class="s-str">'POST'</span>,
       headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
       body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">8453</span>, userOperation: data.userOperation, signature }),
@@ -1126,6 +1210,38 @@ console.<span class="s-fn">log</span>(<span class="s-str">'Key:'</span>, wallet.
 }).<span class="s-fn">then</span>(r => r.<span class="s-fn">json</span>());
 
 console.<span class="s-fn">log</span>(<span class="s-str">'UserOp:'</span>, result.data.userOperationHash);</code></pre>
+
+  <h4 style="margin-top:1rem; font-family:var(--font-hand); font-size:1.3rem; color:var(--ink-blue);">Cross-Chain Bridge</h4>
+  <pre><code><span class="s-kw">import</span> { ethers } <span class="s-kw">from</span> <span class="s-str">'ethers'</span>;
+
+<span class="s-kw">const</span> wallet = <span class="s-kw">new</span> ethers.Wallet(<span class="s-str">'0xYourPrivateKey'</span>);
+
+<span class="s-comment">// Step 1: Prepare bridge UserOp</span>
+<span class="s-kw">const</span> prepareRes = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/bridge'</span>, {
+  method: <span class="s-str">'POST'</span>,
+  headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+  body: JSON.<span class="s-fn">stringify</span>({
+    ownerAddress: wallet.address,
+    sourceChainId: <span class="s-num">137</span>,
+    destChainId: <span class="s-num">42161</span>,
+    rpcUrl: <span class="s-str">'https://polygon-rpc.com'</span>,
+    tokenAddress: <span class="s-str">'0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359'</span>,
+    amount: <span class="s-num">50.0</span>,
+  }),
+});
+<span class="s-kw">const</span> { data: bridgeData } = <span class="s-kw">await</span> prepareRes.<span class="s-fn">json</span>();
+
+<span class="s-comment">// Step 2: Sign locally with ethers.Wallet.signMessage</span>
+<span class="s-kw">const</span> bridgeSig = <span class="s-kw">await</span> wallet.<span class="s-fn">signMessage</span>(ethers.utils.<span class="s-fn">arrayify</span>(bridgeData.hashToSign));
+
+<span class="s-comment">// Step 3: Submit</span>
+<span class="s-kw">const</span> bridgeResult = <span class="s-kw">await</span> <span class="s-fn">fetch</span>(<span class="s-str">'https://smart-wallet-519w.onrender.com/api/v2/submit'</span>, {
+  method: <span class="s-str">'POST'</span>,
+  headers: { <span class="s-str">'Content-Type'</span>: <span class="s-str">'application/json'</span> },
+  body: JSON.<span class="s-fn">stringify</span>({ chainId: <span class="s-num">137</span>, userOperation: bridgeData.userOperation, signature: bridgeSig }),
+}).<span class="s-fn">then</span>(r => r.<span class="s-fn">json</span>());
+
+console.<span class="s-fn">log</span>(<span class="s-str">'Bridge UserOp:'</span>, bridgeResult.data.userOperationHash);</code></pre>
 
   <h4>MetaMask / Browser <code>window.ethereum</code></h4>
   <pre><code><span class="s-kw">const</span> signature = <span class="s-kw">await</span> window.ethereum.<span class="s-fn">request</span>({
@@ -1213,16 +1329,28 @@ console.<span class="s-fn">log</span>(<span class="s-str">'UserOp:'</span>, resu
   }'</code></pre>
 
   <h3 id="example-bridge">Cross-Chain Bridge (Across Protocol)</h3>
-  <p>Bridge USDC from Polygon to Arbitrum:</p>
-  <pre><code>curl -X POST https://smart-wallet-519w.onrender.com/api/bridge \
+  <p>Bridge USDC from Polygon to Arbitrum (client-side signing):</p>
+  <pre><code><span class="s-comment"># Step 1: Prepare bridge UserOp</span>
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/bridge \
   -H "Content-Type: application/json" \
   -d '{
-    "privateKey": "0x...",
+    "ownerAddress": "0xYourEOA",
     "sourceChainId": 137,
     "destChainId": 42161,
     "rpcUrl": "https://polygon-rpc.com",
     "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     "amount": 50.0
+  }'
+
+<span class="s-comment"># Step 2: Sign hashToSign locally with your wallet</span>
+
+<span class="s-comment"># Step 3: Submit signed UserOp</span>
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "userOperation": { "...from prepare response..." },
+    "signature": "0x...your signature..."
   }'</code></pre>
 
   <!-- LLM / AI Usage -->

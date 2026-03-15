@@ -1373,6 +1373,187 @@ router.post('/api/v2/submit', checkRateLimit, async (req, res) => {
   }
 });
 
+// ==================== V2 BRIDGE ENDPOINT (CLIENT-SIDE SIGNING) ====================
+
+router.post('/api/v2/bridge', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      ownerAddress,
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amount,
+      rpcUrl,
+      recipient: explicitRecipient
+    } = req.body;
+
+    // Validate required fields
+    if (!ownerAddress || !sourceChainId || !destChainId || !tokenAddress || !amount || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Required fields: ownerAddress, sourceChainId, destChainId, tokenAddress, amount, rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (sourceChainId === destChainId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Source and destination chains must be different',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (!ethers.utils.isAddress(ownerAddress) || !ethers.utils.isAddress(tokenAddress)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid address format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Amount must be a positive number',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const sourceChain = CHAINS[sourceChainId as keyof typeof CHAINS];
+    if (!sourceChain) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ID ${sourceChainId} is not supported`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const chainConfig = getChainConfig(sourceChainId);
+    if (!chainConfig || !chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(400).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Chain ${sourceChainId} not configured for bundler/paymaster`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Compute smart wallet address from ownerAddress
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain: sourceChain
+    });
+
+    const { toAccount } = await import('viem/accounts');
+    const dummyOwner = toAccount({
+      address: ownerAddress as `0x${string}`,
+      async signMessage() { return "0x" + "00".repeat(31) + "01" + "00".repeat(31) + "01" + "1b" as `0x${string}`; },
+      async signTransaction() { return "0x" as `0x${string}`; },
+      async signTypedData() { return "0x" as `0x${string}`; },
+    });
+
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [dummyOwner as any],
+      version: "1.4.1"
+    });
+
+    const smartWalletAddress = smartAccount.address;
+    const recipient = explicitRecipient && ethers.utils.isAddress(explicitRecipient)
+      ? explicitRecipient
+      : smartWalletAddress;
+
+    console.log(`🌉 [v2] Bridge prepare: ${amount} of ${tokenAddress} from chain ${sourceChainId} → ${destChainId}`);
+    console.log(`🏦 [v2] Smart wallet: ${smartWalletAddress}, Recipient: ${recipient}`);
+
+    // Get token decimals
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function decimals() view returns (uint8)'],
+      new ethers.providers.JsonRpcProvider(rpcUrl)
+    );
+    const decimals = await tokenContract.decimals();
+    const amountInWei = ethers.utils.parseUnits(amount.toString(), decimals).toString();
+
+    // Get Across quote
+    console.log(`📊 [v2] Fetching Across bridge quote...`);
+    const quote = await getAcrossQuote(
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amountInWei,
+      recipient
+    );
+
+    console.log(`📊 [v2] Quote received: output=${quote.outputAmount}, fee=${quote.totalRelayFee.total}`);
+
+    // Build bridge calls (approve SpokePool + depositV3)
+    const bridgeCalls = buildBridgeCalls(
+      quote,
+      smartWalletAddress,
+      recipient,
+      tokenAddress,
+      BigInt(amountInWei),
+      destChainId
+    );
+
+    // Convert to format prepareTransaction expects
+    const calls = bridgeCalls.map(call => ({
+      to: call.to as string,
+      abi: call.abi as any[],
+      functionName: call.functionName,
+      args: call.args.map((arg: any) => typeof arg === 'bigint' ? arg.toString() : arg),
+    }));
+
+    // Prepare UserOp via v2 relay (client-side signing)
+    const result = await prepareTransaction({
+      ownerAddress,
+      chainId: sourceChainId,
+      rpcUrl,
+      calls,
+      bundlerUrl: chainConfig.bundlerUrl,
+      paymasterRPC: chainConfig.paymasterRPC,
+      paymasterToken: tokenAddress, // pay gas in the token being bridged
+    });
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        bridge: {
+          sourceChainId,
+          destChainId,
+          inputToken: tokenAddress,
+          outputToken: quote.outputToken.address,
+          inputAmount: amount.toString(),
+          outputAmount: ethers.utils.formatUnits(quote.outputAmount, quote.outputToken.decimals),
+          fee: ethers.utils.formatUnits(quote.totalRelayFee.total, decimals),
+          recipient,
+          smartWalletAddress,
+          estimatedFillTime: '~2-5 minutes',
+        },
+      },
+      message: 'Bridge UserOperation prepared. Sign hashToSign with personal_sign and submit to /api/v2/submit',
+      timestamp: new Date().toISOString(),
+    });
+
+  } catch (error: any) {
+    console.error('[v2] Bridge prepare error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Bridge Prepare Failed',
+      message: error?.message || 'Failed to prepare bridge UserOperation',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 // System status endpoint for monitoring
 router.get('/api/system/status', (_req, res) => {
   res.json({

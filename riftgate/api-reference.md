@@ -164,15 +164,15 @@ Submit a signed UserOperation to the bundler.
 
 ---
 
-### POST /api/bridge
+### POST /api/v2/bridge
 
-Bridge tokens cross-chain using Across Protocol. Works with all Pimlico-supported chains.
+Bridge tokens cross-chain using Across Protocol with client-side signing. Returns a UserOperation to sign — no private key required.
 
 **Request Body:**
 
 ```json
 {
-  "privateKey": "0x...",
+  "ownerAddress": "0xYourEOAAddress",
   "sourceChainId": 137,
   "destChainId": 42161,
   "rpcUrl": "https://polygon-rpc.com",
@@ -186,7 +186,7 @@ Bridge tokens cross-chain using Across Protocol. Works with all Pimlico-supporte
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| privateKey | hex string | Yes | Owner's private key (v1 endpoint) |
+| ownerAddress | address | Yes | EOA address (NOT private key) |
 | sourceChainId | number | Yes | Source chain ID |
 | destChainId | number | Yes | Destination chain ID |
 | rpcUrl | string | Yes | Source chain RPC |
@@ -200,17 +200,28 @@ Bridge tokens cross-chain using Across Protocol. Works with all Pimlico-supporte
 {
   "success": true,
   "data": {
-    "transactionHash": "0x...",
-    "sourceChainId": 137,
-    "destChainId": 42161,
-    "amount": "10.0",
-    "token": "0x...",
-    "smartWalletAddress": "0x...",
-    "recipient": "0x...",
-    "estimatedFillTime": "~2-5 minutes"
-  }
+    "smartAccountAddress": "0x...",
+    "userOperation": { "...full UserOp..." },
+    "hashToSign": "0xabcdef...",
+    "chainId": 137,
+    "bridge": {
+      "sourceChainId": 137,
+      "destChainId": 42161,
+      "inputToken": "0x...",
+      "outputToken": "0x...",
+      "inputAmount": "10.0",
+      "outputAmount": "9.95",
+      "fee": "0.05",
+      "recipient": "0x...",
+      "smartWalletAddress": "0x...",
+      "estimatedFillTime": "~2-5 minutes"
+    }
+  },
+  "message": "Bridge UserOperation prepared. Sign hashToSign with personal_sign and submit to /api/v2/submit"
 }
 ```
+
+Sign the `hashToSign` and submit via `POST /api/v2/submit` (same as any other v2 operation).
 
 ---
 
@@ -343,18 +354,142 @@ curl -X POST https://smart-wallet-519w.onrender.com/api/v2/prepare \
   }'
 ```
 
-### Cross-Chain Bridge (Across Protocol)
+### Cross-Chain Bridge (Across Protocol — client-side signing)
 ```bash
-curl -X POST https://smart-wallet-519w.onrender.com/api/bridge \
+# Step 1: Prepare
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/bridge \
   -H "Content-Type: application/json" \
   -d '{
-    "privateKey": "0x...",
+    "ownerAddress": "0xYourEOA",
     "sourceChainId": 137,
     "destChainId": 42161,
     "rpcUrl": "https://polygon-rpc.com",
     "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
     "amount": 50.0
   }'
+
+# Step 2: Sign hashToSign locally with your wallet
+
+# Step 3: Submit
+curl -X POST https://smart-wallet-519w.onrender.com/api/v2/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chainId": 137,
+    "userOperation": { "...from prepare response..." },
+    "signature": "0x...your signature..."
+  }'
+```
+
+### Bridge with Privy
+```javascript
+import { usePrivy, useSignMessage } from '@privy-io/react-auth';
+
+function BridgeWithPrivy() {
+  const { user } = usePrivy();
+  const { signMessage } = useSignMessage();
+  const address = user?.wallet?.address;
+
+  async function bridge() {
+    // Step 1: Prepare bridge UserOp
+    const res = await fetch('https://smart-wallet-519w.onrender.com/api/v2/bridge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ownerAddress: address,
+        sourceChainId: 137,
+        destChainId: 42161,
+        rpcUrl: 'https://polygon-rpc.com',
+        tokenAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+        amount: 25.0,
+      }),
+    });
+    const { data } = await res.json();
+
+    // Step 2: Sign with Privy embedded wallet
+    const signature = await signMessage(data.hashToSign);
+
+    // Step 3: Submit
+    await fetch('https://smart-wallet-519w.onrender.com/api/v2/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chainId: 137, userOperation: data.userOperation, signature }),
+    });
+  }
+}
+```
+
+### Bridge with wagmi
+```javascript
+import { useAccount, useSignMessage } from 'wagmi';
+import { toBytes } from 'viem';
+
+function BridgeWithWagmi() {
+  const { address } = useAccount();
+  const { signMessageAsync } = useSignMessage();
+
+  async function bridge() {
+    // Step 1: Prepare bridge UserOp
+    const res = await fetch('https://smart-wallet-519w.onrender.com/api/v2/bridge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ownerAddress: address,
+        sourceChainId: 8453,
+        destChainId: 42161,
+        rpcUrl: 'https://mainnet.base.org',
+        tokenAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+        amount: 100.0,
+      }),
+    });
+    const { data } = await res.json();
+
+    // Step 2: Sign with connected wallet (MetaMask, WalletConnect, etc.)
+    const signature = await signMessageAsync({
+      message: { raw: toBytes(data.hashToSign) },
+    });
+
+    // Step 3: Submit
+    await fetch('https://smart-wallet-519w.onrender.com/api/v2/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chainId: 8453, userOperation: data.userOperation, signature }),
+    });
+  }
+}
+```
+
+### Bridge with ethers.js (server-side)
+```javascript
+import { ethers } from 'ethers';
+
+const wallet = new ethers.Wallet('0xYourPrivateKey');
+
+// Step 1: Prepare bridge UserOp
+const prepareRes = await fetch('https://smart-wallet-519w.onrender.com/api/v2/bridge', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    ownerAddress: wallet.address,
+    sourceChainId: 137,
+    destChainId: 42161,
+    rpcUrl: 'https://polygon-rpc.com',
+    tokenAddress: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+    amount: 50.0,
+  }),
+});
+const { data } = await prepareRes.json();
+
+// Step 2: Sign locally with ethers.Wallet.signMessage
+const signature = await wallet.signMessage(ethers.utils.arrayify(data.hashToSign));
+
+// Step 3: Submit
+const result = await fetch('https://smart-wallet-519w.onrender.com/api/v2/submit', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ chainId: 137, userOperation: data.userOperation, signature }),
+}).then(r => r.json());
+
+console.log('Bridge UserOp:', result.data.userOperationHash);
 ```
 
 ---
