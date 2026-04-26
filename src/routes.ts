@@ -19,7 +19,7 @@ import { toSafeSmartAccount } from 'permissionless/accounts';
 
 const router = Router();
 
-const SUPPORTED_CHAINS_LIST = 'Ethereum (1), Base (8453), Polygon (137), Celo (42220), Arbitrum (42161), Avalanche (43114), BSC (56), Berachain (80094), Lisk (1135)';
+const SUPPORTED_CHAINS_LIST = 'Ethereum (1), Base (8453), Polygon (137), Celo (42220), Arbitrum (42161), Avalanche (43114), BSC (56), Berachain (80094)';
 
 function getChainConfig(chainId: number): { bundlerUrl: string; paymasterRPC: string; envPrefix: string } | null {
   const configs: Record<number, { envPrefix: string }> = {
@@ -31,7 +31,6 @@ function getChainConfig(chainId: number): { bundlerUrl: string; paymasterRPC: st
     43114: { envPrefix: 'AVALANCHE' },
     56: { envPrefix: 'BSC' },
     80094: { envPrefix: 'BERACHAIN' },
-    1135: { envPrefix: 'LISK' },
   };
 
   const config = configs[chainId];
@@ -570,7 +569,6 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       43114: 'https://api.avax.network/ext/bc/C/rpc',
       56: 'https://bsc-dataseed.binance.org',
       80094: 'https://rpc.berachain.com/',
-      1135: 'https://rpc.api.lisk.com',
     };
     const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
 
@@ -993,7 +991,6 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
       43114: 'https://api.avax.network/ext/bc/C/rpc',
       56: 'https://bsc-dataseed.binance.org',
       80094: 'https://rpc.berachain.com/',
-      1135: 'https://rpc.api.lisk.com',
     };
     const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
 

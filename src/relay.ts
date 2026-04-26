@@ -24,14 +24,12 @@ import { createSmartAccountClient } from "permissionless";
 import { ethers } from "ethers";
 import { CHAINS } from "./abstraction";
 import {
-  isLiskChain,
-  isLiskSupportedToken,
-  createLiskPaymasterMiddleware,
-  getLiskGasFees,
-  getLiskPaymasterAddress,
-  getLiskBundlerUrl,
-  buildLiskPaymasterApprovalCall,
-} from "./lisk-paymaster";
+  isCeloChain,
+  isCeloSupportedToken,
+  createCeloPaymasterMiddleware,
+  getCeloPaymasterAddress,
+  buildCeloPaymasterApprovalCall,
+} from "./celo-paymaster";
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -269,18 +267,22 @@ async function prepareUserOp(
 ): Promise<PrepareResult> {
   let smartAccountClient;
 
-  if (isLiskChain(chainId) && paymasterToken) {
-    const liskPaymaster = createLiskPaymasterMiddleware(paymasterToken as Address);
-    const liskBundlerUrl = getLiskBundlerUrl();
-    console.log(`📡 [v2] Using Gelato bundler + Lisk custom paymaster`);
+  if (isCeloChain(chainId) && paymasterToken) {
+    const celoPaymaster = createCeloPaymasterMiddleware(paymasterToken as Address);
+    const pimlicoClient = createPimlicoClient({
+      chain,
+      transport: http(paymasterRPC),
+      entryPoint: { address: entryPoint07Address, version: "0.7" as EntryPointVersion },
+    });
+    console.log(`📡 [v2] Using Pimlico bundler + Celo custom paymaster`);
 
     smartAccountClient = createSmartAccountClient({
       account: smartAccount,
       chain,
-      bundlerTransport: http(liskBundlerUrl),
-      paymaster: liskPaymaster,
+      bundlerTransport: http(bundlerUrl),
+      paymaster: celoPaymaster,
       userOperation: {
-        estimateFeesPerGas: async () => getLiskGasFees(rpcUrl),
+        estimateFeesPerGas: async () => (await pimlicoClient.getUserOperationGasPrice()).fast,
       },
     });
   } else {
@@ -305,19 +307,10 @@ async function prepareUserOp(
   console.log(`🔧 [v2] Preparing UserOperation (${calls.length} calls)...`);
   const preparedUserOp: any = await (smartAccountClient as any).prepareUserOperation({
     calls,
-    ...(paymasterToken && !isLiskChain(chainId)
+    ...(paymasterToken && !isCeloChain(chainId)
       ? { paymasterContext: { token: paymasterToken as Address } }
       : {}),
   });
-
-  // Apply gas buffer for Lisk/Gelato — bundler simulation overhead can exceed tight estimates
-  if (isLiskChain(chainId)) {
-    const GAS_MULTIPLIER = 150n; // 1.5x
-    preparedUserOp.callGasLimit = (preparedUserOp.callGasLimit * GAS_MULTIPLIER) / 100n;
-    preparedUserOp.verificationGasLimit = (preparedUserOp.verificationGasLimit * GAS_MULTIPLIER) / 100n;
-    preparedUserOp.preVerificationGas = (preparedUserOp.preVerificationGas * GAS_MULTIPLIER) / 100n;
-    console.log(`⛽ [v2] Lisk gas buffer applied (1.5x): callGas=${preparedUserOp.callGasLimit}, verificationGas=${preparedUserOp.verificationGasLimit}, preVerificationGas=${preparedUserOp.preVerificationGas}`);
-  }
 
   // Compute the Safe operation hash (what the client signs)
   const hashToSign = computeSafeOperationHash(
@@ -473,11 +466,11 @@ export async function prepareTransaction(params: {
   });
 
   // Add paymaster approval if needed
-  if (isLiskChain(chainId) && paymasterToken) {
-    if (!isLiskSupportedToken(paymasterToken)) {
-      throw new Error(`Token ${paymasterToken} not supported by Lisk paymaster`);
+  if (isCeloChain(chainId) && paymasterToken) {
+    if (!isCeloSupportedToken(paymasterToken)) {
+      throw new Error(`Token ${paymasterToken} not supported by Celo paymaster`);
     }
-    transactionCalls.unshift(buildLiskPaymasterApprovalCall(paymasterToken as Address));
+    transactionCalls.unshift(buildCeloPaymasterApprovalCall(paymasterToken as Address));
   } else if (paymasterToken) {
     const pimlicoClient = createPimlicoClient({
       chain,
@@ -524,7 +517,7 @@ export async function submitSignedUserOp(params: {
   const safeSignature = encodeSafeUserOpSignature(signature);
 
   // Determine bundler URL
-  const actualBundlerUrl = isLiskChain(chainId) ? getLiskBundlerUrl() : bundlerUrl;
+  const actualBundlerUrl = bundlerUrl;
 
   // Deserialize UserOp and set the real signature
   const userOp: any = deserializeUserOp(userOperation);
@@ -598,11 +591,11 @@ async function buildTransferCalls(
   amountInWei: bigint,
   paymasterRPC: string
 ): Promise<any[]> {
-  if (isLiskChain(chainId)) {
-    if (!isLiskSupportedToken(tokenAddress)) {
-      throw new Error(`Token ${tokenAddress} not supported by Lisk paymaster. Supported: USDC, USDT`);
+  if (isCeloChain(chainId)) {
+    if (!isCeloSupportedToken(tokenAddress)) {
+      throw new Error(`Token ${tokenAddress} not supported by Celo paymaster. Supported: USDC, USDT`);
     }
-    const paymasterAddress = getLiskPaymasterAddress();
+    const paymasterAddress = getCeloPaymasterAddress();
     return [
       {
         to: getAddress(tokenAddress),

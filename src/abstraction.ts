@@ -16,16 +16,14 @@ import {
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
 import { privateKeyToAccount } from "viem/accounts";
-import { base, polygon, celo, mainnet, arbitrum, avalanche, bsc, berachain, lisk } from "viem/chains";
+import { base, polygon, celo, mainnet, arbitrum, avalanche, bsc, berachain } from "viem/chains";
 import {
-  isLiskChain,
-  isLiskSupportedToken,
-  createLiskPaymasterMiddleware,
-  getLiskGasFees,
-  getLiskPaymasterAddress,
-  getLiskBundlerUrl,
-  buildLiskPaymasterApprovalCall,
-} from "./lisk-paymaster";
+  isCeloChain,
+  isCeloSupportedToken,
+  createCeloPaymasterMiddleware,
+  getCeloPaymasterAddress,
+  buildCeloPaymasterApprovalCall,
+} from "./celo-paymaster";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -38,8 +36,7 @@ export const CHAINS = {
   42161: arbitrum,
   43114: avalanche,
   56: bsc,
-  80094: berachain,
-  1135: lisk
+  80094: berachain
 };
 
 /**
@@ -96,17 +93,14 @@ export const submitTransaction = async (
       chain
     });
 
-    // Create Pimlico client only for non-Lisk chains
-    const pimlicoClient = isLiskChain(chainId)
-      ? null
-      : createPimlicoClient({
-          chain,
-          transport: http(paymasterRPC),
-          entryPoint: {
-            address: entryPoint07Address,
-            version: "0.7" as EntryPointVersion,
-          },
-        });
+    const pimlicoClient = createPimlicoClient({
+      chain,
+      transport: http(paymasterRPC),
+      entryPoint: {
+        address: entryPoint07Address,
+        version: "0.7" as EntryPointVersion,
+      },
+    });
 
     // Create signer from private key
     const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
@@ -155,17 +149,17 @@ export const submitTransaction = async (
       hasCode: isDeployed
     });
 
-    // Create smart account client with ERC-20 paymaster (users pay gas in USDC)
-    const smartAccountClient = isLiskChain(chainId)
+    // Celo builds its own client below (uses our custom paymaster middleware).
+    const smartAccountClient = isCeloChain(chainId)
       ? null
       : createSmartAccountClient({
           account: smartAccount,
           chain,
           bundlerTransport: http(bundlerUrl),
-          paymaster: pimlicoClient!, // ERC-20 Paymaster
+          paymaster: pimlicoClient,
           userOperation: {
             estimateFeesPerGas: async () => {
-              return (await pimlicoClient!.getUserOperationGasPrice()).fast;
+              return (await pimlicoClient.getUserOperationGasPrice()).fast;
             },
           },
         });
@@ -191,41 +185,33 @@ export const submitTransaction = async (
     console.log(`🔧 Sending UserOperation with ERC-20 paymaster (gas paid in tokens)...`);
     let userOperationHash: string;
 
-    if (isLiskChain(chainId)) {
-      // ── Lisk: use custom paymaster ──
-      if (!isLiskSupportedToken(tokenAddress)) {
+    if (isCeloChain(chainId)) {
+      // ── Celo: use custom paymaster + Pimlico bundler ──
+      if (!isCeloSupportedToken(tokenAddress)) {
         return {
           success: false,
-          error: `Token ${tokenAddress} not supported by Lisk paymaster. Supported: USDC, USDT`,
+          error: `Token ${tokenAddress} not supported by Celo paymaster. Supported: USDC, USDT`,
         };
       }
 
-      const liskPaymaster = createLiskPaymasterMiddleware(tokenAddress as Address);
-      const liskBundlerUrl = getLiskBundlerUrl();
-      const liskSmartAccountClient = createSmartAccountClient({
+      const celoPaymaster = createCeloPaymasterMiddleware(tokenAddress as Address);
+      const paymasterAddress = getCeloPaymasterAddress();
+      console.log(`💳 Using Celo custom paymaster: ${paymasterAddress}`);
+      console.log(`📡 Using Pimlico bundler for Celo: ${bundlerUrl}`);
+
+      const celoSmartAccountClient = createSmartAccountClient({
         account: smartAccount,
         chain,
-        bundlerTransport: http(liskBundlerUrl),
-        paymaster: liskPaymaster,
+        bundlerTransport: http(bundlerUrl),
+        paymaster: celoPaymaster,
         userOperation: {
-          estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
-          estimateGas: async (args: { userOperation: any }) => {
-            // Apply 1.5x gas buffer for Gelato bundler — prevents "Compute Unit Limit Exceeded"
-            const op = args.userOperation;
-            return {
-              callGasLimit: BigInt(Math.ceil(Number(op.callGasLimit || 100000n) * 1.5)),
-              verificationGasLimit: BigInt(Math.ceil(Number(op.verificationGasLimit || 100000n) * 1.5)),
-              preVerificationGas: BigInt(Math.ceil(Number(op.preVerificationGas || 60000n) * 1.5)),
-            };
+          estimateFeesPerGas: async () => {
+            return (await pimlicoClient.getUserOperationGasPrice()).fast;
           },
         },
       });
 
-      const paymasterAddress = getLiskPaymasterAddress();
-      console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
-      console.log(`📡 Using Gelato bundler for Lisk: ${liskBundlerUrl}`);
-
-      userOperationHash = await liskSmartAccountClient.sendTransaction({
+      userOperationHash = await celoSmartAccountClient.sendTransaction({
         calls: [
           {
             to: getAddress(tokenAddress),
@@ -244,7 +230,7 @@ export const submitTransaction = async (
     } else {
       // ── Other chains: use Pimlico paymaster ──
       console.log(`💰 Getting token quotes for ERC-20 paymaster...`);
-      const quotes = await pimlicoClient!.getTokenQuotes({
+      const quotes = await pimlicoClient.getTokenQuotes({
         chain,
         tokens: [tokenAddress as Address],
       });
@@ -374,17 +360,14 @@ export const submitUniversalTransaction = async (
       chain
     });
 
-    // Create Pimlico client only for non-Lisk chains
-    const pimlicoClient = isLiskChain(chainId)
-      ? null
-      : createPimlicoClient({
-          chain,
-          transport: http(paymasterRPC),
-          entryPoint: {
-            address: entryPoint07Address,
-            version: "0.7" as EntryPointVersion,
-          },
-        });
+    const pimlicoClient = createPimlicoClient({
+      chain,
+      transport: http(paymasterRPC),
+      entryPoint: {
+        address: entryPoint07Address,
+        version: "0.7" as EntryPointVersion,
+      },
+    });
 
     // Create signer from private key
     const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
@@ -451,48 +434,40 @@ export const submitUniversalTransaction = async (
 
     let userOperationHash: string;
 
-    if (isLiskChain(chainId) && paymasterToken) {
-      // ── Lisk with ERC-20 paymaster: use custom paymaster ──
-      if (!isLiskSupportedToken(paymasterToken)) {
+    if (isCeloChain(chainId) && paymasterToken) {
+      // ── Celo with ERC-20 paymaster: use custom paymaster + Pimlico bundler ──
+      if (!isCeloSupportedToken(paymasterToken)) {
         return {
           success: false,
-          error: `Token ${paymasterToken} not supported by Lisk paymaster. Supported: USDC, USDT`,
+          error: `Token ${paymasterToken} not supported by Celo paymaster. Supported: USDC, USDT`,
         };
       }
 
-      const liskPaymaster = createLiskPaymasterMiddleware(paymasterToken as Address);
-      const liskBundlerUrl = getLiskBundlerUrl();
-      const paymasterAddress = getLiskPaymasterAddress();
-      console.log(`💳 Using Lisk custom paymaster: ${paymasterAddress}`);
-      console.log(`📡 Using Gelato bundler for Lisk: ${liskBundlerUrl}`);
+      const celoPaymaster = createCeloPaymasterMiddleware(paymasterToken as Address);
+      const paymasterAddress = getCeloPaymasterAddress();
+      console.log(`💳 Using Celo custom paymaster: ${paymasterAddress}`);
+      console.log(`📡 Using Pimlico bundler for Celo: ${bundlerUrl}`);
 
-      // Prepend approval for the custom paymaster
-      transactionCalls.unshift(buildLiskPaymasterApprovalCall(paymasterToken as Address));
+      transactionCalls.unshift(buildCeloPaymasterApprovalCall(paymasterToken as Address));
 
       smartAccountClient = createSmartAccountClient({
         account: smartAccount,
         chain,
-        bundlerTransport: http(liskBundlerUrl),
-        paymaster: liskPaymaster,
+        bundlerTransport: http(bundlerUrl),
+        paymaster: celoPaymaster,
         userOperation: {
-          estimateFeesPerGas: async () => getLiskGasFees(rpcNodeProvider),
-          estimateGas: async (args: { userOperation: any }) => {
-            const op = args.userOperation;
-            return {
-              callGasLimit: BigInt(Math.ceil(Number(op.callGasLimit || 100000n) * 1.5)),
-              verificationGasLimit: BigInt(Math.ceil(Number(op.verificationGasLimit || 100000n) * 1.5)),
-              preVerificationGas: BigInt(Math.ceil(Number(op.preVerificationGas || 60000n) * 1.5)),
-            };
+          estimateFeesPerGas: async () => {
+            return (await pimlicoClient!.getUserOperationGasPrice()).fast;
           },
         },
       });
 
-      console.log(`🔧 Sending UserOperation with Lisk custom paymaster...`);
+      console.log(`🔧 Sending UserOperation with Celo custom paymaster...`);
       userOperationHash = await smartAccountClient.sendTransaction({
         calls: transactionCalls,
       });
     } else {
-      // ── Other chains (or Lisk without paymaster token): use Pimlico ──
+      // ── Other chains: use Pimlico ──
       if (paymasterToken) {
         console.log(`💰 Getting token quotes for ERC-20 paymaster with token: ${paymasterToken}...`);
 

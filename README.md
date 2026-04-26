@@ -9,8 +9,8 @@ A production-ready TypeScript Express server that enables **gasless token transf
 - **Smart Contract Wallets**: Every user gets a deterministic Safe smart account
 - **Gasless Transactions**: Users pay gas fees in USDC/tokens, not ETH
 - **Account Abstraction**: ERC-4337 standard with Pimlico bundler/paymaster
-- **Custom Paymaster (Lisk)**: Self-hosted verifying paymaster for chains not supported by Pimlico
-- **Multi-chain Support**: Base, Polygon, Lisk, and 100+ EVM chains
+- **Custom Paymaster (Celo)**: Self-hosted verifying paymaster for chains not supported by Pimlico's ERC-20 paymaster
+- **Multi-chain Support**: Base, Polygon, Celo, and 100+ EVM chains
 - **Universal API**: Single `/api/transfer` endpoint for all chains — same request format regardless of chain
 - **Production Ready**: Rate limiting, circuit breakers, error handling
 
@@ -20,11 +20,11 @@ A production-ready TypeScript Express server that enables **gasless token transf
 2. **Smart account created** deterministically (same address across chains)
 3. **Paymaster sponsors gas** using user's tokens:
    - **Most chains**: Pimlico ERC-20 paymaster
-   - **Lisk**: Custom `LiskPaymaster` verifying paymaster + Gelato bundler
+   - **Celo**: Custom `Erc20Paymaster` verifying paymaster + Pimlico bundler (see [CELO_PAYMASTER.md](CELO_PAYMASTER.md))
 4. **Transaction executed** instantly, returns UserOperation hash
 5. **User tracks** transaction on block explorer
 
-> **Note**: The API interface is identical for all chains. Lisk uses a custom paymaster behind the scenes, but callers send the exact same request body and receive the same response format.
+> **Note**: The API interface is identical for all chains. Celo uses a custom paymaster behind the scenes, but callers send the exact same request body and receive the same response format.
 
 ## 🛠️ Quick Setup
 
@@ -56,15 +56,11 @@ BASE_PAYMASTER_RPC=https://api.pimlico.io/v2/base/rpc?apikey=your_pimlico_api_ke
 POLYGON_BUNDLER_URL=https://api.pimlico.io/v1/polygon/rpc?apikey=your_pimlico_api_key_here
 POLYGON_PAYMASTER_RPC=https://api.pimlico.io/v2/polygon/rpc?apikey=your_pimlico_api_key_here
 
-# Celo Chain (Chain ID: 42220)
+# Celo Chain (Chain ID: 42220) — bundler from Pimlico, custom paymaster contract
 CELO_BUNDLER_URL=https://api.pimlico.io/v1/celo/rpc?apikey=your_pimlico_api_key_here
-CELO_PAYMASTER_RPC=https://api.pimlico.io/v2/celo/rpc?apikey=your_pimlico_api_key_here
-
-# ── Lisk Custom Paymaster (Chain ID: 1135) ──
-LISK_PAYMASTER_ADDRESS=0x427236c2FbF46372e115027c367E63Bbb11F932C
-LISK_PAYMASTER_SIGNER_KEY=your_paymaster_signer_private_key
-GELATO_API_KEY=your_gelato_api_key_here
-ENSO_API_KEY=your_enso_api_key_here
+CELO_PAYMASTER_ADDRESS=your_deployed_celo_paymaster_address
+CELO_PAYMASTER_SIGNER_KEY=your_celo_paymaster_signer_private_key
+CELO_PAYMASTER_OWNER_KEY=your_celo_paymaster_owner_private_key
 
 # Development settings
 NODE_ENV=development
@@ -135,7 +131,6 @@ Transfer any ERC-20 token on any supported chain with gas paid in tokens.
 | Ethereum | 1 | Pimlico | Pimlico ERC-20 |
 | Base | 8453 | Pimlico | Pimlico ERC-20 |
 | Polygon | 137 | Pimlico | Pimlico ERC-20 |
-| Celo | 42220 | Pimlico | Pimlico ERC-20 |
 | Arbitrum | 42161 | Pimlico | Pimlico ERC-20 |
 | Avalanche | 43114 | Pimlico | Pimlico ERC-20 |
 | BNB Chain | 56 | Pimlico | Pimlico ERC-20 |
@@ -144,9 +139,9 @@ Transfer any ERC-20 token on any supported chain with gas paid in tokens.
 **Custom paymaster chains:**
 | Chain | ID | Bundler | Paymaster | Supported Tokens |
 |-------|------|---------|-----------|-----------------|
-| Lisk | 1135 | Gelato | Custom `LiskPaymaster` | Bridged USDC (`0xF242...cc71`), Bridged USDT (`0x05D0...C117b9`) |
+| Celo | 42220 | Pimlico | Custom `Erc20Paymaster` | USDC (`0xceBA9300...18C`), USDT (`0x48065fbB...D5e`) |
 
-> Lisk is not supported by Pimlico, so we run a self-hosted **verifying paymaster** contract with Gelato as the bundler. The API is identical — callers don't need to know the difference.
+> Pimlico's ERC-20 paymaster does not currently sponsor any tokens on Celo, so we run a self-hosted **verifying paymaster** contract there. The bundler is still Pimlico. The API is identical — callers don't need to know the difference. See [CELO_PAYMASTER.md](CELO_PAYMASTER.md) for full architecture, addresses, and operations.
 
 **Easily Expandable to 100+ Chains:**
 - Ethereum, Arbitrum, Optimism, zkSync Era
@@ -179,9 +174,9 @@ const CHAINS = {
 
 ### Core Components
 - **Smart Accounts**: Safe v1.4.1 smart contract wallets (deterministic address across all chains)
-- **Bundler**: Pimlico (most chains) / Gelato (Lisk) for UserOperation submission
-- **Paymaster**: Pimlico ERC-20 paymaster (most chains) / Custom verifying paymaster (Lisk)
-- **ETH Price Oracle**: Enso API (queried via Ethereum mainnet WETH) for real-time ETH pricing on custom paymaster chains
+- **Bundler**: Pimlico for all chains
+- **Paymaster**: Pimlico ERC-20 paymaster (most chains) / Custom `Erc20Paymaster` verifying paymaster (Celo)
+- **CELO/USD Price Oracle**: Coingecko free public API, fetched fresh per UserOp on Celo
 - **Rate Limiter**: 1000 requests/minute per IP
 - **Circuit Breaker**: Resilience for external service calls
 
@@ -194,18 +189,17 @@ const CHAINS = {
 └──────────────────────────┬──────────────────────────────────┘
                            │
                     ┌──────▼──────┐
-                    │ isLiskChain? │
+                    │ isCeloChain? │
                     └──────┬──────┘
                      No    │    Yes
               ┌────────────┴────────────┐
               ▼                         ▼
     ┌─────────────────┐     ┌──────────────────────┐
-    │    Pimlico       │     │  Custom Paymaster     │
+    │     Pimlico      │     │   Custom Paymaster    │
     │  ─────────────   │     │  ──────────────────   │
-    │  Bundler: Pimlico│     │  Bundler: Gelato      │
-    │  Paymaster: ERC20│     │  Paymaster: LiskPM    │
-    │  Gas: Pimlico    │     │  Gas: Lisk RPC        │
-    │  Price: Pimlico  │     │  Price: Enso API      │
+    │  Bundler: Pimlico│     │  Bundler: Pimlico     │
+    │  Paymaster: ERC20│     │  Paymaster: own contr.│
+    │  Gas: Pimlico    │     │  Price: Coingecko/req │
     └─────────────────┘     └──────────────────────┘
               │                         │
               └────────────┬────────────┘
@@ -213,34 +207,32 @@ const CHAINS = {
               Same response format to caller
 ```
 
-### Custom Paymaster (Lisk) - How It Works
-
-1. **Backend signs** the UserOperation off-chain with `LISK_PAYMASTER_SIGNER_KEY`
-2. **LiskPaymaster contract** verifies the signature in `validatePaymasterUserOp`
-3. **User's callData executes** (includes token approve + transfer)
-4. **postOp** pulls tokens from the smart account to cover gas costs
-5. **Token cost** = gas used * ETH price / token price + markup (configurable)
-
-Contract: [`0x427236c2FbF46372e115027c367E63Bbb11F932C`](https://blockscout.lisk.com/address/0x427236c2FbF46372e115027c367E63Bbb11F932C) on Lisk mainnet.
+For Celo's full architecture, addresses, deduction math, and ops loop, see
+[CELO_PAYMASTER.md](CELO_PAYMASTER.md).
 
 ### Project Structure
 ```
 src/
 ├── server.ts          # Express server setup
-├── config.ts          # Environment configuration
 ├── types.ts           # TypeScript interfaces
-├── middleware.ts      # Error handling & logging
 ├── routes.ts          # API endpoints & validation
-├── abstraction.ts     # Smart account & Pimlico/Lisk routing logic
-├── lisk-paymaster.ts  # Custom paymaster middleware, gas estimation, Enso pricing
+├── abstraction.ts     # Smart account & Pimlico/Celo routing logic
+├── celo-paymaster.ts  # Custom paymaster middleware, signs pricePerNative per UserOp
+├── relay.ts           # Client-signed UserOp relay path
 ├── utils.ts           # Rate limiting & circuit breakers
-└── chains.ts          # Blockchain configurations
+└── ...
 
 contracts/
 ├── src/
-│   └── LiskPaymaster.sol  # Verifying paymaster (ERC-4337 v0.7, EntryPoint v0.7)
+│   └── Erc20Paymaster.sol  # Verifying paymaster (ERC-4337 v0.7, EntryPoint v0.7)
+├── script/
+│   └── DeployErc20Paymaster.s.sol
 ├── foundry.toml
 └── remappings.txt
+
+scripts/
+├── configure-celo-paymaster.ts   # Enables USDC/USDT on the deployed Celo paymaster
+└── probe-celo-paymaster-tokens.ts # Diagnostic for Pimlico's Celo paymaster coverage
 ```
 
 ## 🔒 Security Features
@@ -569,70 +561,6 @@ curl -X POST http://localhost:3000/api/transaction \
   }'
 ```
 
-### Lisk Bridged USDC/USDT Transfer Example (Custom Paymaster) 🟢
-
-> These use the exact same API as other chains. The custom paymaster is handled transparently on the backend. Lisk uses **bridged** versions of USDC and USDT (not native Circle/Tether tokens). The ETH price for gas conversion is fetched from the Enso API using **Ethereum mainnet** (chain ID 1) since Enso does not support the Lisk chain directly.
-
-13. **Transfer Bridged USDC on Lisk**:
-```bash
-curl -X POST http://localhost:3000/api/transfer \
-  -H "Content-Type: application/json" \
-  -d '{
-    "chainId": 1135,
-    "tokenAddress": "0xF242275d3a6527d877f2c927a82D9b057609cc71",
-    "recipient": "0xRecipientAddress",
-    "amount": 5.0,
-    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
-    "ownerAddress": "0xYourEOAAddress",
-    "rpcUrl": "https://rpc.api.lisk.com"
-  }'
-```
-
-14. **Transfer Bridged USDT on Lisk**:
-```bash
-curl -X POST http://localhost:3000/api/transfer \
-  -H "Content-Type: application/json" \
-  -d '{
-    "chainId": 1135,
-    "tokenAddress": "0x05D032ac25d322df992303dCa074EE7392C117b9",
-    "recipient": "0xRecipientAddress",
-    "amount": 10.0,
-    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
-    "ownerAddress": "0xYourEOAAddress",
-    "rpcUrl": "https://rpc.api.lisk.com"
-  }'
-```
-
-15. **Universal transaction on Lisk** (with Bridged USDC for gas):
-```bash
-curl -X POST http://localhost:3000/api/transaction \
-  -H "Content-Type: application/json" \
-  -d '{
-    "chainId": 1135,
-    "calls": [
-      {
-        "to": "0xF242275d3a6527d877f2c927a82D9b057609cc71",
-        "abi": [
-          {
-            "name": "transfer",
-            "type": "function",
-            "inputs": [
-              {"type": "address", "name": "to"},
-              {"type": "uint256", "name": "amount"}
-            ]
-          }
-        ],
-        "functionName": "transfer",
-        "args": ["0xRecipientAddress", "5000000"]
-      }
-    ],
-    "ownerPrivateKey": "YOUR_PRIVATE_KEY_HERE",
-    "ownerAddress": "0xYourEOAAddress",
-    "rpcUrl": "https://rpc.api.lisk.com",
-    "paymasterToken": "0xF242275d3a6527d877f2c927a82D9b057609cc71"
-  }'
-```
-
 ---
 
 ## 🔐 V2 API — Client-Side Signing (No Private Keys)
@@ -820,17 +748,17 @@ const result = await submitRes.json();
 console.log('UserOp hash:', result.data.userOperationHash);
 ```
 
-### V2 on Lisk (works identically)
+### V2 on Celo (works identically)
 
 ```bash
-# Prepare (Lisk USDC transfer — no private key sent!)
+# Prepare (Celo USDC transfer — no private key sent!)
 curl -X POST http://localhost:3000/api/v2/prepare \
   -H "Content-Type: application/json" \
   -d '{
     "ownerAddress": "0xYourEOAAddress",
-    "chainId": 1135,
-    "rpcUrl": "https://rpc.api.lisk.com",
-    "tokenAddress": "0xF242275d3a6527d877f2c927a82D9b057609cc71",
+    "chainId": 42220,
+    "rpcUrl": "https://forno.celo.org",
+    "tokenAddress": "0xcebA9300f2b948710d2653dD7B07f33A8B32118C",
     "recipient": "0xRecipientAddress",
     "amount": 5.0
   }'

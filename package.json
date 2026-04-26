@@ -7,8 +7,7 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "type-check": "tsc --noEmit",
-    "docs": "npx serve riftgate -l 3001"
+    "type-check": "tsc --noEmit"
   },
   "keywords": [
     "typescript",
