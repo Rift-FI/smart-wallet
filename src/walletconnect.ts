@@ -136,13 +136,25 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
 /**
  * Handle incoming DApp requests
  */
+/**
+ * Build the Safe smart account for the given session — used by the
+ * personal_sign / eth_sign / eth_signTypedData handlers so that signatures
+ * verify against the SMART ACCOUNT address via EIP-1271, not the underlying
+ * EOA. permissionless auto-wraps in ERC-6492 if the account isn't deployed.
+ */
+async function getSmartAccountForSession(config: SessionConfig) {
+  const chain = CHAINS[config.chainId as keyof typeof CHAINS];
+  if (!chain) throw new Error(`Unsupported chain: ${config.chainId}`);
+  const publicClient = createPublicClient({ chain, transport: http(config.rpcUrl) });
+  const owner = privateKeyToAccount(config.ownerPrivateKey as `0x${string}`);
+  return toSafeSmartAccount({ client: publicClient, owners: [owner], version: "1.4.1" });
+}
+
 async function handleSessionRequest(
   method: string,
   params: any[],
   config: SessionConfig
 ): Promise<any> {
-  const signer = new ethers.Wallet(config.ownerPrivateKey);
-
   switch (method) {
     case "eth_sendTransaction": {
       const tx = params[0];
@@ -179,13 +191,19 @@ async function handleSessionRequest(
       // params: [message, address]
       const message = params[0];
       console.log(`✍️ personal_sign: ${message.slice(0, 100)}...`);
-      return signer.signMessage(ethers.utils.arrayify(message));
+      const smartAccount = await getSmartAccountForSession(config);
+      return await smartAccount.signMessage({
+        message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
+      });
     }
 
     case "eth_sign": {
       // params: [address, message]
       const message = params[1];
-      return signer.signMessage(ethers.utils.arrayify(message));
+      const smartAccount = await getSmartAccountForSession(config);
+      return await smartAccount.signMessage({
+        message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
+      });
     }
 
     case "eth_signTypedData":
@@ -193,14 +211,19 @@ async function handleSessionRequest(
     case "eth_signTypedData_v4": {
       // params: [address, typedData]
       const typedData = typeof params[1] === "string" ? JSON.parse(params[1]) : params[1];
-      const { domain, types, message } = typedData;
+      const { domain, types, message, primaryType } = typedData;
 
-      // Remove EIP712Domain from types if present (ethers handles it)
+      // Remove EIP712Domain from types — viem/permissionless handles it
       const filteredTypes = { ...types };
       delete filteredTypes.EIP712Domain;
 
-      const signature = await signer._signTypedData(domain, filteredTypes, message);
-      return signature;
+      const smartAccount = await getSmartAccountForSession(config);
+      return await smartAccount.signTypedData({
+        domain,
+        types: filteredTypes,
+        primaryType,
+        message,
+      });
     }
 
     case "eth_chainId": {
