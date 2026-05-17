@@ -31,7 +31,6 @@ import {
   Address,
   parseUnits,
   getAddress,
-  maxUint256,
   parseAbi,
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
@@ -44,6 +43,7 @@ import {
   getCeloPaymasterAddress,
   estimateTokenCost,
 } from "./celo-paymaster";
+import { buildPaymasterApproveCalls } from "./paymasterApprove";
 
 export interface EstimateTransferArgs {
   chainId: number;
@@ -191,13 +191,14 @@ export async function estimateTransfer(
         },
       });
 
+      const celoApproveCalls = await buildPaymasterApproveCalls(
+        publicClient as any,
+        args.tokenAddress as Address,
+        smartAccount.address,
+        paymasterAddress as Address
+      );
       calls = [
-        {
-          to: getAddress(args.tokenAddress),
-          abi: parseAbi(["function approve(address,uint256)"]),
-          functionName: "approve",
-          args: [paymasterAddress, maxUint256],
-        },
+        ...celoApproveCalls,
         {
           to: getAddress(args.tokenAddress),
           abi: parseAbi(["function transfer(address,uint256)"]),
@@ -229,13 +230,14 @@ export async function estimateTransfer(
         },
       });
 
+      const pimlicoApproveCalls = await buildPaymasterApproveCalls(
+        publicClient as any,
+        args.tokenAddress as Address,
+        smartAccount.address,
+        paymasterAddress as Address
+      );
       calls = [
-        {
-          to: getAddress(args.tokenAddress),
-          abi: parseAbi(["function approve(address,uint256)"]),
-          functionName: "approve",
-          args: [paymasterAddress, maxUint256],
-        },
+        ...pimlicoApproveCalls,
         {
           to: getAddress(args.tokenAddress),
           abi: parseAbi(["function transfer(address,uint256)"]),

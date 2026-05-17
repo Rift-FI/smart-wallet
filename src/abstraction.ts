@@ -10,7 +10,6 @@ import {
   Address,
   parseUnits,
   getAddress,
-  maxUint256,
   parseAbi,
 
 } from "viem";
@@ -22,8 +21,8 @@ import {
   isCeloSupportedToken,
   createCeloPaymasterMiddleware,
   getCeloPaymasterAddress,
-  buildCeloPaymasterApprovalCall,
 } from "./celo-paymaster";
+import { buildPaymasterApproveCalls } from "./paymasterApprove";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -211,14 +210,19 @@ export const submitTransaction = async (
         },
       });
 
+      // Tether-safe approval: skips when allowance is already plenty,
+      // and uses zero-first when bumping a non-zero allowance (USDT's
+      // approve race condition).
+      const approveCalls = await buildPaymasterApproveCalls(
+        publicClient as any,
+        tokenAddress as Address,
+        smartAccount.address,
+        paymasterAddress as Address
+      );
+
       userOperationHash = await celoSmartAccountClient.sendTransaction({
         calls: [
-          {
-            to: getAddress(tokenAddress),
-            abi: parseAbi(["function approve(address,uint256)"]),
-            functionName: "approve",
-            args: [paymasterAddress, maxUint256],
-          },
+          ...approveCalls,
           {
             to: getAddress(tokenAddress),
             abi: parseAbi(["function transfer(address,uint256)"]),
@@ -251,14 +255,24 @@ export const submitTransaction = async (
       }
       console.log(`💳 Using paymaster: ${paymaster}`);
 
+      // Tether-safe approval: skips when allowance is already plenty,
+      // and uses zero-first when bumping a non-zero allowance (USDT
+      // on Ethereum mainnet has the famous approve race require).
+      const approveCalls = await buildPaymasterApproveCalls(
+        publicClient as any,
+        tokenAddress as Address,
+        smartAccount.address,
+        paymaster as Address
+      );
+      console.log(
+        `🔓 Paymaster approval plan: ${approveCalls.length} call(s) [${approveCalls
+          .map((c) => `approve(${(c.args as any)[1] === 0n ? "0" : "max"})`)
+          .join(", ") || "skip — allowance already sufficient"}]`
+      );
+
       userOperationHash = await smartAccountClient!.sendTransaction({
         calls: [
-          {
-            to: getAddress(tokenAddress),
-            abi: parseAbi(["function approve(address,uint256)"]),
-            functionName: "approve",
-            args: [paymaster, maxUint256],
-          },
+          ...approveCalls,
           {
             to: getAddress(tokenAddress),
             abi: parseAbi(["function transfer(address,uint256)"]),
@@ -448,7 +462,19 @@ export const submitUniversalTransaction = async (
       console.log(`💳 Using Celo custom paymaster: ${paymasterAddress}`);
       console.log(`📡 Using Pimlico bundler for Celo: ${bundlerUrl}`);
 
-      transactionCalls.unshift(buildCeloPaymasterApprovalCall(paymasterToken as Address));
+      // Tether-safe paymaster approval — skips when allowance is
+      // already plenty, double-approves when bumping non-zero.
+      const celoApproveCalls = await buildPaymasterApproveCalls(
+        publicClient as any,
+        paymasterToken as Address,
+        smartAccount.address,
+        paymasterAddress as Address
+      );
+      // Reverse so unshift order matches: first unshifted = last in array.
+      // We want: approve(0) (if needed) → approve(max) → original calls.
+      for (let i = celoApproveCalls.length - 1; i >= 0; i--) {
+        transactionCalls.unshift(celoApproveCalls[i] as any);
+      }
 
       smartAccountClient = createSmartAccountClient({
         account: smartAccount,
@@ -494,14 +520,20 @@ export const submitUniversalTransaction = async (
         console.log(`💳 Using ERC-20 paymaster: ${paymaster}`);
         paymasterContext = { token: paymasterToken as Address };
 
-        // Add token approval call if using ERC-20 paymaster
-        transactionCalls.unshift({
-          to: getAddress(paymasterToken),
-          value: BigInt(0),
-          abi: parseAbi(["function approve(address,uint256)"]) as any,
-          functionName: "approve",
-          args: [paymaster, maxUint256],
-        });
+        // Tether-safe paymaster approval — skips when allowance is
+        // already plenty, double-approves when bumping non-zero.
+        const universalApproveCalls = await buildPaymasterApproveCalls(
+          publicClient as any,
+          paymasterToken as Address,
+          smartAccount.address,
+          paymaster as Address
+        );
+        console.log(
+          `🔓 Universal approval plan: ${universalApproveCalls.length} call(s)`
+        );
+        for (let i = universalApproveCalls.length - 1; i >= 0; i--) {
+          transactionCalls.unshift(universalApproveCalls[i] as any);
+        }
       } else {
         console.log(`💳 Using sponsored gas paymaster`);
       }
