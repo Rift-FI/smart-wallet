@@ -1,4 +1,4 @@
-# Smart Wallets Server 🔥
+# Smart Wallets Server 
 
 **ERC-4337 Account Abstraction API** - Gasless ERC-20 token transfers with Pimlico + Custom Paymaster infrastructure
 
