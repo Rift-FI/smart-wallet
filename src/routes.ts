@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
 import { prepareTransfer, prepareTransaction, submitSignedUserOp } from './relay';
+import { estimateTransfer } from './estimateTransfer';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
 import { pairAndApprove, disconnectSession, getActiveSessions, getPendingRequests, approveRequest, rejectRequest } from './walletconnect';
 import { 
@@ -246,6 +247,120 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       message: error?.message || 'Failed to process transfer',
       timestamp: new Date().toISOString(),
     } as any);
+  }
+});
+
+// ==================== FEE ESTIMATION ENDPOINT ====================
+
+/**
+ * Estimate the paymaster's gas fee, denominated in the same token the user
+ * is sending. Read-only — no private key required.
+ *
+ * Use this BEFORE calling /api/transfer to:
+ *   - Show the user a "send X, gas ~Y, total Z" preview.
+ *   - Hard-block submission when totalNeeded > balance (the exact failure
+ *     mode that produces opaque "paymaster rejected" errors on Ethereum
+ *     mainnet when the user has exactly enough for the send but not for
+ *     the gas).
+ */
+interface EstimateFeeBody {
+  chainId: number;
+  tokenAddress: string;
+  recipient: string;
+  amount: number;
+  ownerAddress: string;
+  rpcUrl: string;
+}
+
+router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      chainId,
+      tokenAddress,
+      recipient,
+      amount,
+      ownerAddress,
+      rpcUrl,
+    } = req.body as EstimateFeeBody;
+
+    if (!chainId || !tokenAddress || !recipient || !amount || !ownerAddress || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'All fields required: chainId, tokenAddress, recipient, amount, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (!ethers.utils.isAddress(tokenAddress) || !ethers.utils.isAddress(recipient) || !ethers.utils.isAddress(ownerAddress)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid address format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Amount must be a positive number',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} is not supported. Supported chains: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (!chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster env for chain ${chainId} (${chainConfig.envPrefix})`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const result = await paymasterCircuitBreaker.execute(() =>
+      estimateTransfer({
+        chainId,
+        rpcUrl,
+        tokenAddress,
+        amount,
+        recipient,
+        ownerAddress,
+        bundlerUrl: chainConfig.bundlerUrl,
+        paymasterRPC: chainConfig.paymasterRPC,
+      })
+    );
+
+    if (result.success) {
+      return res.json({
+        success: true,
+        data: result.data,
+        message: `Fee estimated for chain ${chainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      error: 'Estimate Failed',
+      message: result.error || 'Could not estimate fee',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('Estimate fee error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to estimate fee',
+      timestamp: new Date().toISOString(),
+    });
   }
 });
 
