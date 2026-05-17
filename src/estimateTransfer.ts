@@ -77,6 +77,15 @@ export interface EstimateTransferData {
   paymaster: string;
   /** Raw native-currency gas cost (wei), exposed for debugging. */
   rawGasNativeWei: string;
+  /**
+   * `true` when prepareUserOperation simulation failed and the fee
+   * was computed heuristically (gas price × typical gas limit). The
+   * actual on-chain gas may be lower; the heuristic is intentionally
+   * generous to keep the user safe.
+   */
+  degraded?: boolean;
+  /** If `degraded`, the reason the precise simulation failed. */
+  degradedReason?: string;
 }
 
 export interface EstimateTransferResult {
@@ -239,32 +248,78 @@ export async function estimateTransfer(
     // Build the UserOp without submitting. permissionless calls the bundler
     // to estimate gas and the paymaster to compute paymasterAndData — both
     // are read-only RPC calls.
-    const userOp: any = await smartAccountClient.prepareUserOperation({
-      calls,
-      ...(isCeloChain(args.chainId)
-        ? {}
-        : { paymasterContext: { token: args.tokenAddress as Address } }),
-    });
+    //
+    // On Ethereum mainnet (and occasionally other chains) the bundler's
+    // simulation reverts when the user's balance is near the edge of
+    // covering (send amount + paymaster gas), or when the smart account
+    // isn't deployed yet and Safe's first-deploy UserOp simulation is
+    // flaky. The error surfaces as "approve | transfer returned no data
+    // (0x)" or similar — opaque to the caller.
+    //
+    // Strategy: try the precise path first; if it fails, fall back to a
+    // heuristic estimate (gas price × typical gas budget × paymaster
+    // exchange rate). The UI gets `degraded: true` so it knows the
+    // number is rough.
+    let gasCostNativeWei: bigint;
+    let gasFeeInTokenWei: bigint;
+    let degraded = false;
+    let degradedReason: string | undefined;
 
-    const preVerificationGas = BigInt(userOp.preVerificationGas ?? 0);
-    const verificationGasLimit = BigInt(userOp.verificationGasLimit ?? 0);
-    const callGasLimit = BigInt(userOp.callGasLimit ?? 0);
-    const paymasterVerificationGasLimit = BigInt(
-      userOp.paymasterVerificationGasLimit ?? 0
-    );
-    const paymasterPostOpGasLimit = BigInt(userOp.paymasterPostOpGasLimit ?? 0);
-    const maxFeePerGas = BigInt(userOp.maxFeePerGas ?? 0);
+    try {
+      const userOp: any = await smartAccountClient.prepareUserOperation({
+        calls,
+        ...(isCeloChain(args.chainId)
+          ? {}
+          : { paymasterContext: { token: args.tokenAddress as Address } }),
+      });
 
-    const totalGas =
-      preVerificationGas +
-      verificationGasLimit +
-      callGasLimit +
-      paymasterVerificationGasLimit +
-      paymasterPostOpGasLimit;
-    const gasCostNativeWei = totalGas * maxFeePerGas;
+      const preVerificationGas = BigInt(userOp.preVerificationGas ?? 0);
+      const verificationGasLimit = BigInt(userOp.verificationGasLimit ?? 0);
+      const callGasLimit = BigInt(userOp.callGasLimit ?? 0);
+      const paymasterVerificationGasLimit = BigInt(
+        userOp.paymasterVerificationGasLimit ?? 0
+      );
+      const paymasterPostOpGasLimit = BigInt(
+        userOp.paymasterPostOpGasLimit ?? 0
+      );
+      const maxFeePerGas = BigInt(userOp.maxFeePerGas ?? 0);
+
+      const totalGas =
+        preVerificationGas +
+        verificationGasLimit +
+        callGasLimit +
+        paymasterVerificationGasLimit +
+        paymasterPostOpGasLimit;
+      gasCostNativeWei = totalGas * maxFeePerGas;
+
+      if (gasCostNativeWei === 0n) {
+        // prepareUserOperation didn't throw but returned zero gas
+        // limits — happens when the bundler RPC misbehaves. Treat as
+        // a simulation failure and fall through to heuristic.
+        throw new Error("prepareUserOperation returned zero gas limits");
+      }
+    } catch (simErr: any) {
+      degraded = true;
+      degradedReason = simErr?.message?.split("\n")[0] || "Simulation failed";
+      console.warn(
+        `[estimateTransfer] prepareUserOperation failed, using heuristic — ${degradedReason}`
+      );
+
+      // Check whether the smart account is already deployed. A fresh
+      // deploy on Ethereum mainnet can use ~600k-1M gas; a subsequent
+      // transfer is ~200k-350k. Pad either way for safety.
+      const code = await publicClient.getBytecode({
+        address: smartAccount.address,
+      });
+      const isDeployed = !!code && code !== "0x";
+      const heuristicGasLimit = isDeployed ? 350_000n : 900_000n;
+
+      const gasPrice = await pimlicoClient.getUserOperationGasPrice();
+      const heuristicMaxFeePerGas = BigInt(gasPrice.fast.maxFeePerGas);
+      gasCostNativeWei = heuristicGasLimit * heuristicMaxFeePerGas;
+    }
 
     // Convert native-currency gas cost → token units.
-    let gasFeeInTokenWei: bigint;
     if (isCeloChain(args.chainId)) {
       // celo-paymaster's helper mirrors the on-chain pricing formula.
       gasFeeInTokenWei = estimateTokenCost(gasCostNativeWei, decimals);
@@ -306,6 +361,12 @@ export async function estimateTransfer(
         deficit: ethers.utils.formatUnits(deficit.toString(), decimals),
         paymaster: paymasterAddress,
         rawGasNativeWei: gasCostNativeWei.toString(),
+        ...(degraded
+          ? {
+              degraded: true as const,
+              ...(degradedReason ? { degradedReason } : {}),
+            }
+          : {}),
       },
     };
   } catch (error: any) {
