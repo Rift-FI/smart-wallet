@@ -3,6 +3,7 @@ import { HealthCheckResponse, TypedResponse } from './types';
 import { submitTransaction, submitUniversalTransaction } from './abstraction';
 import { prepareTransfer, prepareTransaction, submitSignedUserOp } from './relay';
 import { estimateTransfer } from './estimateTransfer';
+import { estimateBridge } from './estimateBridge';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
 import { pairAndApprove, disconnectSession, getActiveSessions, getPendingRequests, approveRequest, rejectRequest } from './walletconnect';
 import { 
@@ -842,6 +843,132 @@ interface BridgeBody {
   rpcUrl: string;
   recipient?: string; // optional, defaults to same smart wallet on dest chain
 }
+
+// ==================== BRIDGE QUOTE (read-only) ====================
+
+/**
+ * Get a real bridge quote (Across rate + paymaster gas in the token).
+ * Read-only — no private key required.
+ *
+ * Use this BEFORE /api/bridge so the user sees the actual outputAmount
+ * (net of Across LP+relayer fees) AND the gas they'll pay in the same
+ * token. The existing /bridge/quote backend route previously returned
+ * `inputAmount × 0.999` which silently disagreed with what /api/bridge
+ * actually delivered.
+ */
+interface BridgeQuoteBody {
+  sourceChainId: number;
+  destChainId: number;
+  tokenAddress: string;
+  amount: number;
+  ownerAddress: string;
+  recipient?: string;
+  rpcUrl: string;
+}
+
+router.post('/api/bridge-quote', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amount,
+      ownerAddress,
+      recipient,
+      rpcUrl,
+    } = req.body as BridgeQuoteBody;
+
+    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !ownerAddress || !rpcUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Required: sourceChainId, destChainId, tokenAddress, amount, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (!ethers.utils.isAddress(tokenAddress) || !ethers.utils.isAddress(ownerAddress)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid address format',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (recipient && !ethers.utils.isAddress(recipient)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid recipient address',
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (typeof amount !== 'number' || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Amount must be a positive number',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const chainConfig = getChainConfig(sourceChainId);
+    if (!chainConfig) {
+      return res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ${sourceChainId} not supported. ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (!chainConfig.bundlerUrl || !chainConfig.paymasterRPC) {
+      return res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster env for chain ${sourceChainId} (${chainConfig.envPrefix})`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const result = await paymasterCircuitBreaker.execute(() =>
+      estimateBridge({
+        sourceChainId,
+        destChainId,
+        tokenAddress,
+        amount,
+        ownerAddress,
+        ...(recipient ? { recipient } : {}),
+        rpcUrl,
+        bundlerUrl: chainConfig.bundlerUrl,
+        paymasterRPC: chainConfig.paymasterRPC,
+      })
+    );
+
+    if (result.success) {
+      return res.json({
+        success: true,
+        data: result.data,
+        message: `Bridge quote ${sourceChainId} → ${destChainId}`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      error: 'Quote Failed',
+      message: result.error || 'Could not produce bridge quote',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('Bridge quote error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'Failed to produce bridge quote',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
+// ==================== BRIDGE EXECUTE (signs and broadcasts) ====================
 
 router.post('/api/bridge', checkRateLimit, async (req, res) => {
   try {
