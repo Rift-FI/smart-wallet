@@ -33,6 +33,7 @@ import { toAccount } from "viem/accounts";
 import { CHAINS } from "./abstraction";
 import { getAcrossQuote, buildBridgeCalls, type BridgeQuoteResponse } from "./bridge";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
+import { getFlatMarkupConfig, buildFlatMarkupTransferCall } from "./markup";
 
 export interface EstimateBridgeArgs {
   sourceChainId: number;
@@ -62,8 +63,15 @@ export interface EstimateBridgeData {
   outputAmount: string;
   /** inputAmount − outputAmount — Across's protocol-level fee. */
   bridgeFee: string;
-  /** Paymaster gas, in the same token, human-readable. */
+  /**
+   * Combined per-tx fee in the same token (paymaster gas + flat-fee
+   * markup). Human-readable.
+   */
   gasFeeInToken: string;
+  /** Paymaster's portion of gasFeeInToken (just the on-chain gas). */
+  paymasterFeeInToken: string;
+  /** Flat-fee markup portion of gasFeeInToken (0 when disabled). */
+  markupFeeInToken: string;
   /** inputAmount + gasFeeInToken — what the smart wallet must hold. */
   totalNeeded: string;
   /** Current smart-account balance, human-readable. */
@@ -234,7 +242,18 @@ export async function estimateBridge(
       amountInWei,
       args.destChainId
     );
-    const calls = [...paymasterApproveCalls, ...bridgeCalls];
+    // Append the same flat-fee markup transfer /api/bridge will
+    // execute (via submitUniversalTransaction). Including it here so
+    // the gas estimate accounts for the extra ERC-20 transfer.
+    const flatMarkupCall = buildFlatMarkupTransferCall({
+      tokenAddress: args.tokenAddress as Address,
+      config: getFlatMarkupConfig(),
+    });
+    const calls = [
+      ...paymasterApproveCalls,
+      ...bridgeCalls,
+      ...(flatMarkupCall ? [flatMarkupCall] : []),
+    ];
 
     // ── Try precise gas, fall back to heuristic on revert ────────
     let gasCostNativeWei: bigint;
@@ -278,7 +297,15 @@ export async function estimateBridge(
     const exchangeRate = BigInt(quotes[0].exchangeRate);
     gasFeeInTokenWei = (gasCostNativeWei * exchangeRate) / 10n ** 18n;
 
-    const totalNeededWei = amountInWei + gasFeeInTokenWei;
+    // Flat-fee markup that /api/bridge will charge (via the appended
+    // transfer in submitUniversalTransaction). Surface it here so the
+    // quote and sufficiency check are honest.
+    const flatMarkupConfig = getFlatMarkupConfig();
+    const markupAmountWei = flatMarkupConfig.enabled
+      ? flatMarkupConfig.amountWei
+      : 0n;
+
+    const totalNeededWei = amountInWei + gasFeeInTokenWei + markupAmountWei;
     const sufficient = tokenBalance >= totalNeededWei;
     const deficit = sufficient ? 0n : totalNeededWei - tokenBalance;
 
@@ -298,7 +325,15 @@ export async function estimateBridge(
         ),
         bridgeFee: ethers.utils.formatUnits(bridgeFeeWei.toString(), decimals),
         gasFeeInToken: ethers.utils.formatUnits(
+          (gasFeeInTokenWei + markupAmountWei).toString(),
+          decimals
+        ),
+        paymasterFeeInToken: ethers.utils.formatUnits(
           gasFeeInTokenWei.toString(),
+          decimals
+        ),
+        markupFeeInToken: ethers.utils.formatUnits(
+          markupAmountWei.toString(),
           decimals
         ),
         totalNeeded: ethers.utils.formatUnits(

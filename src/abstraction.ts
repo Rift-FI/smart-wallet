@@ -23,7 +23,12 @@ import {
   getCeloPaymasterAddress,
 } from "./celo-paymaster";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
-import { getMarkupConfig, buildMarkupTransferCall } from "./markup";
+import {
+  getMarkupConfig,
+  buildMarkupTransferCall,
+  getFlatMarkupConfig,
+  buildFlatMarkupTransferCall,
+} from "./markup";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -509,6 +514,21 @@ export const submitUniversalTransaction = async (
         transactionCalls.unshift(celoApproveCalls[i] as any);
       }
 
+      // Flat-fee markup for universal txns ($0.10 by default,
+      // env-configurable). Appended AFTER the user's calls so it's
+      // part of the same UserOp and the paymaster gas estimate
+      // accounts for the extra transfer.
+      const celoFlatMarkup = buildFlatMarkupTransferCall({
+        tokenAddress: paymasterToken as Address,
+        config: getFlatMarkupConfig(),
+      });
+      if (celoFlatMarkup) {
+        console.log(
+          `💸 [celo universal] Flat markup → transfer(${celoFlatMarkup.args[0]}, ${celoFlatMarkup.args[1]})`
+        );
+        transactionCalls.push(celoFlatMarkup as any);
+      }
+
       smartAccountClient = createSmartAccountClient({
         account: smartAccount,
         chain,
@@ -566,6 +586,20 @@ export const submitUniversalTransaction = async (
         );
         for (let i = universalApproveCalls.length - 1; i >= 0; i--) {
           transactionCalls.unshift(universalApproveCalls[i] as any);
+        }
+
+        // Flat-fee markup ($0.10 in paymaster token by default).
+        // Appended AFTER user's calls — included in the same UserOp
+        // so paymaster gas estimate covers the extra transfer.
+        const pimlicoFlatMarkup = buildFlatMarkupTransferCall({
+          tokenAddress: paymasterToken as Address,
+          config: getFlatMarkupConfig(),
+        });
+        if (pimlicoFlatMarkup) {
+          console.log(
+            `💸 [universal] Flat markup → transfer(${pimlicoFlatMarkup.args[0]}, ${pimlicoFlatMarkup.args[1]})`
+          );
+          transactionCalls.push(pimlicoFlatMarkup as any);
         }
       } else {
         console.log(`💳 Using sponsored gas paymaster`);

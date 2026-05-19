@@ -106,3 +106,85 @@ export function buildMarkupTransferCall(opts: {
     args: [opts.config.treasury, markup],
   };
 }
+
+// ─── Flat-fee markup (used by bridge + universal txns) ───────────────
+//
+// For non-transfer flows (bridge, swap, arbitrary contract calls)
+// there's no clear "transfer amount" to multiply 0.5% against. We
+// instead charge a flat fee in the paymaster token (USDC / USDT,
+// both 6 decimals) per UserOp.
+//
+// Configured via env:
+//   MARKUP_FLAT_FEE_TOKEN_UNITS — raw token units. Default 100_000
+//     (= $0.10 in any 6-decimal stable). Set to 0 to disable.
+//
+// Reuses the same RIFT_MARKUP_TREASURY_ADDRESS as the percentage
+// markup — single destination, simpler accounting.
+
+const DEFAULT_FLAT_FEE_TOKEN_UNITS = 100_000n; // $0.10 in USDC/USDT (6 decimals)
+
+export interface FlatMarkupConfig {
+  enabled: boolean;
+  amountWei: bigint;
+  treasury: Address | null;
+}
+
+export function getFlatMarkupConfig(): FlatMarkupConfig {
+  const rawAmount = process.env.MARKUP_FLAT_FEE_TOKEN_UNITS;
+  const rawTreasury = process.env.RIFT_MARKUP_TREASURY_ADDRESS;
+
+  let amountWei: bigint;
+  if (rawAmount === undefined) {
+    amountWei = DEFAULT_FLAT_FEE_TOKEN_UNITS;
+  } else {
+    try {
+      amountWei = BigInt(rawAmount);
+    } catch {
+      console.warn(
+        `[markup] Invalid MARKUP_FLAT_FEE_TOKEN_UNITS="${rawAmount}"; flat markup disabled.`
+      );
+      return { enabled: false, amountWei: 0n, treasury: null };
+    }
+  }
+  if (amountWei <= 0n) {
+    return { enabled: false, amountWei: 0n, treasury: null };
+  }
+  if (!rawTreasury || !/^0x[a-fA-F0-9]{40}$/.test(rawTreasury)) {
+    console.warn(
+      "[markup] RIFT_MARKUP_TREASURY_ADDRESS missing or invalid; flat markup disabled."
+    );
+    return { enabled: false, amountWei: 0n, treasury: null };
+  }
+  return {
+    enabled: true,
+    amountWei,
+    treasury: getAddress(rawTreasury) as Address,
+  };
+}
+
+/**
+ * Build a flat-fee transfer call for non-transfer flows (bridge,
+ * universal txns). Returns null when disabled.
+ *
+ * The token used is whichever paymaster token the UserOp pays gas in —
+ * caller passes `tokenAddress`. We trust the caller's token because
+ * the flat fee env value is denominated in 6-decimal stable units
+ * (matching USDC/USDT on every chain we support).
+ */
+export function buildFlatMarkupTransferCall(opts: {
+  tokenAddress: Address;
+  config: FlatMarkupConfig;
+}): {
+  to: Address;
+  abi: any;
+  functionName: "transfer";
+  args: [Address, bigint];
+} | null {
+  if (!opts.config.enabled || !opts.config.treasury) return null;
+  return {
+    to: opts.tokenAddress,
+    abi: parseAbi(["function transfer(address,uint256)"]),
+    functionName: "transfer",
+    args: [opts.config.treasury, opts.config.amountWei],
+  };
+}
