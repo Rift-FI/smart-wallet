@@ -44,6 +44,7 @@ import {
   estimateTokenCost,
 } from "./celo-paymaster";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
+import { getMarkupConfig, buildMarkupTransferCall } from "./markup";
 
 export interface EstimateTransferArgs {
   chainId: number;
@@ -86,6 +87,15 @@ export interface EstimateTransferData {
   degraded?: boolean;
   /** If `degraded`, the reason the precise simulation failed. */
   degradedReason?: string;
+  /**
+   * Just the paymaster's portion of `gasFeeInToken`. Same token,
+   * same units. `gasFeeInToken = paymasterFeeInToken + markupFeeInToken`.
+   */
+  paymasterFeeInToken: string;
+  /** Just the markup portion. 0 when markup is disabled. */
+  markupFeeInToken: string;
+  /** Markup rate applied. 0 when markup is disabled. */
+  markupBps: number;
 }
 
 export interface EstimateTransferResult {
@@ -205,6 +215,16 @@ export async function estimateTransfer(
           functionName: "transfer",
           args: [getAddress(args.recipient), amountInWei],
         },
+        // Mirror submitTransaction: markup transfer is part of the
+        // UserOp so paymaster gas estimate accounts for the extra call.
+        ...(() => {
+          const c = buildMarkupTransferCall({
+            tokenAddress: args.tokenAddress as Address,
+            transferAmountWei: amountInWei,
+            config: getMarkupConfig(),
+          });
+          return c ? [c] : [];
+        })(),
       ];
     } else {
       const quotes = await pimlicoClient.getTokenQuotes({
@@ -244,6 +264,16 @@ export async function estimateTransfer(
           functionName: "transfer",
           args: [getAddress(args.recipient), amountInWei],
         },
+        // Mirror submitTransaction: markup transfer is part of the
+        // UserOp so paymaster gas estimate accounts for the extra call.
+        ...(() => {
+          const c = buildMarkupTransferCall({
+            tokenAddress: args.tokenAddress as Address,
+            transferAmountWei: amountInWei,
+            config: getMarkupConfig(),
+          });
+          return c ? [c] : [];
+        })(),
       ];
     }
 
@@ -338,7 +368,20 @@ export async function estimateTransfer(
       gasFeeInTokenWei = (gasCostNativeWei * exchangeRate) / 10n ** 18n;
     }
 
-    const totalNeeded = amountInWei + gasFeeInTokenWei;
+    // Markup math. Single source of truth: markup.ts. We compute here
+    // EVEN IF buildMarkupTransferCall above returned null (markup
+    // disabled / 0-amount), because we want the response shape to be
+    // consistent — `markupFeeInToken: "0"` is honest signal.
+    const markupConfig = getMarkupConfig();
+    const markupAmountWei = markupConfig.enabled
+      ? (amountInWei * BigInt(markupConfig.bps)) / 10_000n
+      : 0n;
+
+    // `gasFeeInToken` = paymaster gas + markup. Combined value so old
+    // clients (and the existing app UI) keep displaying the correct
+    // total deducted. Breakdown fields below for new clients.
+    const combinedFeeWei = gasFeeInTokenWei + markupAmountWei;
+    const totalNeeded = amountInWei + combinedFeeWei;
     const sufficient = tokenBalance >= totalNeeded;
     const deficit = sufficient ? 0n : totalNeeded - tokenBalance;
 
@@ -350,10 +393,21 @@ export async function estimateTransfer(
         token: args.tokenAddress,
         tokenDecimals: decimals,
         sendAmount: ethers.utils.formatUnits(amountInWei.toString(), decimals),
+        // Combined fee — what the user's wallet actually loses per tx
+        // BEYOND the send amount itself (paymaster + markup).
         gasFeeInToken: ethers.utils.formatUnits(
+          combinedFeeWei.toString(),
+          decimals
+        ),
+        paymasterFeeInToken: ethers.utils.formatUnits(
           gasFeeInTokenWei.toString(),
           decimals
         ),
+        markupFeeInToken: ethers.utils.formatUnits(
+          markupAmountWei.toString(),
+          decimals
+        ),
+        markupBps: markupConfig.bps,
         totalNeeded: ethers.utils.formatUnits(totalNeeded.toString(), decimals),
         tokenBalance: ethers.utils.formatUnits(
           tokenBalance.toString(),

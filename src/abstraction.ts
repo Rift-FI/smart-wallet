@@ -23,6 +23,7 @@ import {
   getCeloPaymasterAddress,
 } from "./celo-paymaster";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
+import { getMarkupConfig, buildMarkupTransferCall } from "./markup";
 
 // Environment variables loaded via import "dotenv/config"
 
@@ -220,6 +221,19 @@ export const submitTransaction = async (
         paymasterAddress as Address
       );
 
+      // Global service-fee markup — same logic as the Pimlico path.
+      const celoMarkupConfig = getMarkupConfig();
+      const celoMarkupCall = buildMarkupTransferCall({
+        tokenAddress: tokenAddress as Address,
+        transferAmountWei: amountInWei,
+        config: celoMarkupConfig,
+      });
+      if (celoMarkupCall) {
+        console.log(
+          `💸 [celo] Markup: ${celoMarkupConfig.bps} bps → transfer(${celoMarkupConfig.treasury}, ${celoMarkupCall.args[1]})`
+        );
+      }
+
       userOperationHash = await celoSmartAccountClient.sendTransaction({
         calls: [
           ...approveCalls,
@@ -229,6 +243,7 @@ export const submitTransaction = async (
             functionName: "transfer",
             args: [getAddress(recipient), amountInWei],
           },
+          ...(celoMarkupCall ? [celoMarkupCall] : []),
         ],
       });
     } else {
@@ -270,6 +285,23 @@ export const submitTransaction = async (
           .join(", ") || "skip — allowance already sufficient"}]`
       );
 
+      // Global service-fee markup (0.5% of transfer amount by default,
+      // env-configurable). Appended as a second transfer in the same
+      // UserOp so the paymaster's gas pull and our markup happen
+      // atomically with the user's transfer. No bypass — applies to
+      // every caller. See src/markup.ts.
+      const markupConfig = getMarkupConfig();
+      const markupCall = buildMarkupTransferCall({
+        tokenAddress: tokenAddress as Address,
+        transferAmountWei: amountInWei,
+        config: markupConfig,
+      });
+      if (markupCall) {
+        console.log(
+          `💸 Markup: ${markupConfig.bps} bps → transfer(${markupConfig.treasury}, ${markupCall.args[1]})`
+        );
+      }
+
       userOperationHash = await smartAccountClient!.sendTransaction({
         calls: [
           ...approveCalls,
@@ -279,6 +311,7 @@ export const submitTransaction = async (
             functionName: "transfer",
             args: [getAddress(recipient), amountInWei],
           },
+          ...(markupCall ? [markupCall] : []),
         ],
         paymasterContext: {
           token: tokenAddress as Address,
