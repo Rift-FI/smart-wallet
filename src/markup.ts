@@ -34,14 +34,24 @@ export interface MarkupConfig {
   treasury: Address | null;
 }
 
-export function getMarkupConfig(): MarkupConfig {
-  const rawBps = process.env.MARKUP_BPS;
+/**
+ * @param overrideBps  When provided (caller passed a per-key bps from
+ *   the backend's MARKUP_BPS_OVERRIDES), use it instead of the env
+ *   default. 0 is a valid value — it means "no send markup for this
+ *   key" — so we check for undefined, not falsiness.
+ */
+export function getMarkupConfig(overrideBps?: number): MarkupConfig {
   const rawTreasury = process.env.RIFT_MARKUP_TREASURY_ADDRESS;
 
-  const bps = rawBps !== undefined ? Number(rawBps) : DEFAULT_MARKUP_BPS;
+  const bps =
+    overrideBps !== undefined && Number.isFinite(overrideBps) && overrideBps >= 0
+      ? overrideBps
+      : process.env.MARKUP_BPS !== undefined
+        ? Number(process.env.MARKUP_BPS)
+        : DEFAULT_MARKUP_BPS;
   if (!Number.isFinite(bps) || bps < 0) {
     console.warn(
-      `[markup] Invalid MARKUP_BPS="${rawBps}"; markup disabled until corrected.`
+      `[markup] Invalid markup bps (override=${overrideBps}, env="${process.env.MARKUP_BPS}"); markup disabled until corrected.`
     );
     return { enabled: false, bps: 0, treasury: null };
   }

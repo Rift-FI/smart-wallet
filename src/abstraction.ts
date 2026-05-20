@@ -64,7 +64,9 @@ export const submitTransaction = async (
   recipient: string,
   ownerPrivateKey: string,
   bundlerUrl: string,
-  paymasterRPC: string
+  paymasterRPC: string,
+  /** Per-key markup override (bps). Undefined → MARKUP_BPS env default. */
+  markupBpsOverride?: number
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -227,7 +229,7 @@ export const submitTransaction = async (
       );
 
       // Global service-fee markup — same logic as the Pimlico path.
-      const celoMarkupConfig = getMarkupConfig();
+      const celoMarkupConfig = getMarkupConfig(markupBpsOverride);
       const celoMarkupCall = buildMarkupTransferCall({
         tokenAddress: tokenAddress as Address,
         transferAmountWei: amountInWei,
@@ -295,7 +297,7 @@ export const submitTransaction = async (
       // UserOp so the paymaster's gas pull and our markup happen
       // atomically with the user's transfer. No bypass — applies to
       // every caller. See src/markup.ts.
-      const markupConfig = getMarkupConfig();
+      const markupConfig = getMarkupConfig(markupBpsOverride);
       const markupCall = buildMarkupTransferCall({
         tokenAddress: tokenAddress as Address,
         transferAmountWei: amountInWei,

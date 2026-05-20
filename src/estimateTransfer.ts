@@ -55,6 +55,8 @@ export interface EstimateTransferArgs {
   ownerAddress: string;
   bundlerUrl: string;
   paymasterRPC: string;
+  /** Per-key markup override (bps). Undefined → MARKUP_BPS env default. */
+  markupBps?: number;
 }
 
 export interface EstimateTransferData {
@@ -221,7 +223,7 @@ export async function estimateTransfer(
           const c = buildMarkupTransferCall({
             tokenAddress: args.tokenAddress as Address,
             transferAmountWei: amountInWei,
-            config: getMarkupConfig(),
+            config: getMarkupConfig(args.markupBps),
           });
           return c ? [c] : [];
         })(),
@@ -270,7 +272,7 @@ export async function estimateTransfer(
           const c = buildMarkupTransferCall({
             tokenAddress: args.tokenAddress as Address,
             transferAmountWei: amountInWei,
-            config: getMarkupConfig(),
+            config: getMarkupConfig(args.markupBps),
           });
           return c ? [c] : [];
         })(),
@@ -372,7 +374,7 @@ export async function estimateTransfer(
     // EVEN IF buildMarkupTransferCall above returned null (markup
     // disabled / 0-amount), because we want the response shape to be
     // consistent — `markupFeeInToken: "0"` is honest signal.
-    const markupConfig = getMarkupConfig();
+    const markupConfig = getMarkupConfig(args.markupBps);
     const markupAmountWei = markupConfig.enabled
       ? (amountInWei * BigInt(markupConfig.bps)) / 10_000n
       : 0n;

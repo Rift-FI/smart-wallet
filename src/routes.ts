@@ -93,6 +93,12 @@ interface UniversalTransferBody {
   ownerPrivateKey: string;
   ownerAddress: string;
   rpcUrl: string;
+  /**
+   * Optional per-key markup override (bps) from the backend. When
+   * present, overrides the global MARKUP_BPS env for this transfer's
+   * send markup. 0 = no markup for this key.
+   */
+  markupBps?: number;
 }
 
 router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
@@ -109,7 +115,8 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       amount,
       ownerPrivateKey,
       ownerAddress,
-      rpcUrl
+      rpcUrl,
+      markupBps
     } = req.body as UniversalTransferBody;
 
     // Validate required fields
@@ -216,7 +223,8 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
         recipient,
         ownerPrivateKey,
         bundlerUrl,
-        paymasterRPC
+        paymasterRPC,
+        markupBps
       )
     );
 
@@ -271,6 +279,8 @@ interface EstimateFeeBody {
   amount: number;
   ownerAddress: string;
   rpcUrl: string;
+  /** Per-key markup override (bps) so the preview matches the charge. */
+  markupBps?: number;
 }
 
 router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
@@ -282,6 +292,7 @@ router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
       amount,
       ownerAddress,
       rpcUrl,
+      markupBps,
     } = req.body as EstimateFeeBody;
 
     if (!chainId || !tokenAddress || !recipient || !amount || !ownerAddress || !rpcUrl) {
@@ -337,6 +348,7 @@ router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
         ownerAddress,
         bundlerUrl: chainConfig.bundlerUrl,
         paymasterRPC: chainConfig.paymasterRPC,
+        ...(markupBps !== undefined ? { markupBps } : {}),
       })
     );
 
