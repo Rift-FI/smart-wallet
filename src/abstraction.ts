@@ -26,6 +26,7 @@ import { buildPaymasterApproveCalls } from "./paymasterApprove";
 import {
   getMarkupConfig,
   buildMarkupTransferCall,
+  buildProjectMarkupTransferCall,
   getFlatMarkupConfig,
   buildFlatMarkupTransferCall,
 } from "./markup";
@@ -66,7 +67,11 @@ export const submitTransaction = async (
   bundlerUrl: string,
   paymasterRPC: string,
   /** Per-key markup override (bps). Undefined → MARKUP_BPS env default. */
-  markupBpsOverride?: number
+  markupBpsOverride?: number,
+  /** Project's own markup bps — paid to the project's own treasury. */
+  projectMarkupBps?: number,
+  /** Project's own treasury address (required when projectMarkupBps > 0). */
+  projectTreasuryAddress?: string
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -228,7 +233,7 @@ export const submitTransaction = async (
         paymasterAddress as Address
       );
 
-      // Global service-fee markup — same logic as the Pimlico path.
+      // Rift's platform markup → Rift treasury (env).
       const celoMarkupConfig = getMarkupConfig(markupBpsOverride);
       const celoMarkupCall = buildMarkupTransferCall({
         tokenAddress: tokenAddress as Address,
@@ -237,7 +242,19 @@ export const submitTransaction = async (
       });
       if (celoMarkupCall) {
         console.log(
-          `💸 [celo] Markup: ${celoMarkupConfig.bps} bps → transfer(${celoMarkupConfig.treasury}, ${celoMarkupCall.args[1]})`
+          `💸 [celo] Rift markup: ${celoMarkupConfig.bps} bps → transfer(${celoMarkupConfig.treasury}, ${celoMarkupCall.args[1]})`
+        );
+      }
+      // Project's own markup → project treasury (per-request).
+      const celoProjectMarkupCall = buildProjectMarkupTransferCall({
+        tokenAddress: tokenAddress as Address,
+        transferAmountWei: amountInWei,
+        projectBps: projectMarkupBps,
+        projectTreasury: projectTreasuryAddress,
+      });
+      if (celoProjectMarkupCall) {
+        console.log(
+          `💸 [celo] Project markup: ${projectMarkupBps} bps → transfer(${celoProjectMarkupCall.args[0]}, ${celoProjectMarkupCall.args[1]})`
         );
       }
 
@@ -251,6 +268,7 @@ export const submitTransaction = async (
             args: [getAddress(recipient), amountInWei],
           },
           ...(celoMarkupCall ? [celoMarkupCall] : []),
+          ...(celoProjectMarkupCall ? [celoProjectMarkupCall] : []),
         ],
       });
     } else {
@@ -292,11 +310,9 @@ export const submitTransaction = async (
           .join(", ") || "skip — allowance already sufficient"}]`
       );
 
-      // Global service-fee markup (0.5% of transfer amount by default,
-      // env-configurable). Appended as a second transfer in the same
-      // UserOp so the paymaster's gas pull and our markup happen
-      // atomically with the user's transfer. No bypass — applies to
-      // every caller. See src/markup.ts.
+      // Rift's platform markup (0.5% default, env-configurable, per-key
+      // overridable) → Rift treasury. Appended in the same UserOp so the
+      // paymaster gas pull + markup happen atomically with the transfer.
       const markupConfig = getMarkupConfig(markupBpsOverride);
       const markupCall = buildMarkupTransferCall({
         tokenAddress: tokenAddress as Address,
@@ -305,7 +321,21 @@ export const submitTransaction = async (
       });
       if (markupCall) {
         console.log(
-          `💸 Markup: ${markupConfig.bps} bps → transfer(${markupConfig.treasury}, ${markupCall.args[1]})`
+          `💸 Rift markup: ${markupConfig.bps} bps → transfer(${markupConfig.treasury}, ${markupCall.args[1]})`
+        );
+      }
+      // Project's own markup → project's own treasury (per-request,
+      // resolved from the Project DB row by the backend). Charged ON
+      // TOP of Rift's cut.
+      const projectMarkupCall = buildProjectMarkupTransferCall({
+        tokenAddress: tokenAddress as Address,
+        transferAmountWei: amountInWei,
+        projectBps: projectMarkupBps,
+        projectTreasury: projectTreasuryAddress,
+      });
+      if (projectMarkupCall) {
+        console.log(
+          `💸 Project markup: ${projectMarkupBps} bps → transfer(${projectMarkupCall.args[0]}, ${projectMarkupCall.args[1]})`
         );
       }
 
@@ -319,6 +349,7 @@ export const submitTransaction = async (
             args: [getAddress(recipient), amountInWei],
           },
           ...(markupCall ? [markupCall] : []),
+          ...(projectMarkupCall ? [projectMarkupCall] : []),
         ],
         paymasterContext: {
           token: tokenAddress as Address,

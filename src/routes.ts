@@ -99,6 +99,10 @@ interface UniversalTransferBody {
    * send markup. 0 = no markup for this key.
    */
   markupBps?: number;
+  /** Project's own markup bps — paid to the project's own treasury. */
+  projectMarkupBps?: number;
+  /** Project's treasury address (required when projectMarkupBps > 0). */
+  projectTreasuryAddress?: string;
 }
 
 router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
@@ -116,7 +120,9 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       ownerPrivateKey,
       ownerAddress,
       rpcUrl,
-      markupBps
+      markupBps,
+      projectMarkupBps,
+      projectTreasuryAddress
     } = req.body as UniversalTransferBody;
 
     // Validate required fields
@@ -224,7 +230,9 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
         ownerPrivateKey,
         bundlerUrl,
         paymasterRPC,
-        markupBps
+        markupBps,
+        projectMarkupBps,
+        projectTreasuryAddress
       )
     );
 
@@ -281,6 +289,10 @@ interface EstimateFeeBody {
   rpcUrl: string;
   /** Per-key markup override (bps) so the preview matches the charge. */
   markupBps?: number;
+  /** Project's own markup bps — so the preview matches what's charged. */
+  projectMarkupBps?: number;
+  /** Project's treasury address (required when projectMarkupBps > 0). */
+  projectTreasuryAddress?: string;
 }
 
 router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
@@ -293,6 +305,8 @@ router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
       ownerAddress,
       rpcUrl,
       markupBps,
+      projectMarkupBps,
+      projectTreasuryAddress,
     } = req.body as EstimateFeeBody;
 
     if (!chainId || !tokenAddress || !recipient || !amount || !ownerAddress || !rpcUrl) {
@@ -349,6 +363,10 @@ router.post('/api/estimate-fee', checkRateLimit, async (req, res) => {
         bundlerUrl: chainConfig.bundlerUrl,
         paymasterRPC: chainConfig.paymasterRPC,
         ...(markupBps !== undefined ? { markupBps } : {}),
+        ...(projectMarkupBps !== undefined ? { projectMarkupBps } : {}),
+        ...(projectTreasuryAddress !== undefined
+          ? { projectTreasuryAddress }
+          : {}),
       })
     );
 

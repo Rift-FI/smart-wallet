@@ -117,6 +117,69 @@ export function buildMarkupTransferCall(opts: {
   };
 }
 
+/**
+ * Build the PROJECT's own markup transfer — charged ON TOP of Rift's
+ * markup and paid to the project's own treasury, NOT Rift's.
+ *
+ * Unlike Rift's markup (env-driven treasury), the project's bps and
+ * treasury come per-request from the backend (resolved from the
+ * Project DB row). Returns null when bps is 0/missing, treasury is
+ * missing/invalid, or the computed amount rounds to 0.
+ *
+ * Applies to transfers only (send / offramp / pay). Bridge + arbitrary
+ * txns never carry a project cut.
+ */
+export function buildProjectMarkupTransferCall(opts: {
+  tokenAddress: Address;
+  transferAmountWei: bigint;
+  projectBps?: number | undefined;
+  projectTreasury?: string | undefined;
+}): {
+  to: Address;
+  abi: any;
+  functionName: "transfer";
+  args: [Address, bigint];
+} | null {
+  const { projectBps, projectTreasury } = opts;
+  if (
+    projectBps === undefined ||
+    !Number.isFinite(projectBps) ||
+    projectBps <= 0
+  ) {
+    return null;
+  }
+  if (!projectTreasury || !/^0x[a-fA-F0-9]{40}$/.test(projectTreasury)) {
+    return null;
+  }
+  const markup = computeMarkupAmount(opts.transferAmountWei, projectBps);
+  if (markup === 0n) return null;
+  return {
+    to: opts.tokenAddress,
+    abi: parseAbi(["function transfer(address,uint256)"]),
+    functionName: "transfer",
+    args: [getAddress(projectTreasury) as Address, markup],
+  };
+}
+
+/** Compute the project markup amount in raw token units (for previews). */
+export function computeProjectMarkupAmount(
+  transferAmountWei: bigint,
+  projectBps?: number | undefined,
+  projectTreasury?: string | undefined
+): bigint {
+  if (
+    projectBps === undefined ||
+    !Number.isFinite(projectBps) ||
+    projectBps <= 0
+  ) {
+    return 0n;
+  }
+  if (!projectTreasury || !/^0x[a-fA-F0-9]{40}$/.test(projectTreasury)) {
+    return 0n;
+  }
+  return computeMarkupAmount(transferAmountWei, projectBps);
+}
+
 // ─── Flat-fee markup (used by bridge + universal txns) ───────────────
 //
 // For non-transfer flows (bridge, swap, arbitrary contract calls)

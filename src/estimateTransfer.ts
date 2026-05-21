@@ -44,7 +44,12 @@ import {
   estimateTokenCost,
 } from "./celo-paymaster";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
-import { getMarkupConfig, buildMarkupTransferCall } from "./markup";
+import {
+  getMarkupConfig,
+  buildMarkupTransferCall,
+  buildProjectMarkupTransferCall,
+  computeProjectMarkupAmount,
+} from "./markup";
 
 export interface EstimateTransferArgs {
   chainId: number;
@@ -57,6 +62,10 @@ export interface EstimateTransferArgs {
   paymasterRPC: string;
   /** Per-key markup override (bps). Undefined → MARKUP_BPS env default. */
   markupBps?: number;
+  /** Project's own markup bps — paid to the project's treasury. */
+  projectMarkupBps?: number;
+  /** Project's treasury address (required when projectMarkupBps > 0). */
+  projectTreasuryAddress?: string;
 }
 
 export interface EstimateTransferData {
@@ -98,6 +107,10 @@ export interface EstimateTransferData {
   markupFeeInToken: string;
   /** Markup rate applied. 0 when markup is disabled. */
   markupBps: number;
+  /** The project's own markup portion, paid to the project's treasury. 0 when unset. */
+  projectMarkupFeeInToken: string;
+  /** The project's markup rate. 0 when unset. */
+  projectMarkupBps: number;
 }
 
 export interface EstimateTransferResult {
@@ -227,6 +240,16 @@ export async function estimateTransfer(
           });
           return c ? [c] : [];
         })(),
+        // Project's own markup transfer (paid to the project's treasury).
+        ...(() => {
+          const c = buildProjectMarkupTransferCall({
+            tokenAddress: args.tokenAddress as Address,
+            transferAmountWei: amountInWei,
+            projectBps: args.projectMarkupBps,
+            projectTreasury: args.projectTreasuryAddress,
+          });
+          return c ? [c] : [];
+        })(),
       ];
     } else {
       const quotes = await pimlicoClient.getTokenQuotes({
@@ -273,6 +296,16 @@ export async function estimateTransfer(
             tokenAddress: args.tokenAddress as Address,
             transferAmountWei: amountInWei,
             config: getMarkupConfig(args.markupBps),
+          });
+          return c ? [c] : [];
+        })(),
+        // Project's own markup transfer (paid to the project's treasury).
+        ...(() => {
+          const c = buildProjectMarkupTransferCall({
+            tokenAddress: args.tokenAddress as Address,
+            transferAmountWei: amountInWei,
+            projectBps: args.projectMarkupBps,
+            projectTreasury: args.projectTreasuryAddress,
           });
           return c ? [c] : [];
         })(),
@@ -379,10 +412,19 @@ export async function estimateTransfer(
       ? (amountInWei * BigInt(markupConfig.bps)) / 10_000n
       : 0n;
 
-    // `gasFeeInToken` = paymaster gas + markup. Combined value so old
-    // clients (and the existing app UI) keep displaying the correct
-    // total deducted. Breakdown fields below for new clients.
-    const combinedFeeWei = gasFeeInTokenWei + markupAmountWei;
+    // Project's own markup — paid to the project's treasury, charged on
+    // top of Rift's markup. 0 when the project hasn't configured one.
+    const projectMarkupAmountWei = computeProjectMarkupAmount(
+      amountInWei,
+      args.projectMarkupBps,
+      args.projectTreasuryAddress
+    );
+
+    // `gasFeeInToken` = paymaster gas + Rift markup + project markup.
+    // Combined value so old clients (and the existing app UI) keep
+    // displaying the correct total deducted. Breakdown fields below.
+    const combinedFeeWei =
+      gasFeeInTokenWei + markupAmountWei + projectMarkupAmountWei;
     const totalNeeded = amountInWei + combinedFeeWei;
     const sufficient = tokenBalance >= totalNeeded;
     const deficit = sufficient ? 0n : totalNeeded - tokenBalance;
@@ -410,6 +452,14 @@ export async function estimateTransfer(
           decimals
         ),
         markupBps: markupConfig.bps,
+        projectMarkupFeeInToken: ethers.utils.formatUnits(
+          projectMarkupAmountWei.toString(),
+          decimals
+        ),
+        projectMarkupBps:
+          projectMarkupAmountWei > 0n && args.projectMarkupBps
+            ? args.projectMarkupBps
+            : 0,
         totalNeeded: ethers.utils.formatUnits(totalNeeded.toString(), decimals),
         tokenBalance: ethers.utils.formatUnits(
           tokenBalance.toString(),
