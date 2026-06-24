@@ -227,7 +227,13 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
     console.log(`💰 Balance validation will be performed during smart account transaction`);
     console.log(`⚡ Gas will be sponsored by ERC-20 paymaster using user's tokens`);
 
-    // Execute transfer with circuit breaker
+    // Execute transfer with circuit breaker.
+    // Phase 1: pass through the envelope blob + KMS ARN so makeSigner
+    // can route signing to the enclave when SIGNING_MODE=enclave.
+    const transferSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    const transferBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof transferBlob === "string") transferSignerOpts.envelopeBlob = transferBlob;
+    if (process.env.KMS_KEY_ARN) transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitTransaction(
         chainId,
@@ -240,7 +246,8 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
         paymasterRPC,
         markupBps,
         projectMarkupBps,
-        projectTreasuryAddress
+        projectTreasuryAddress,
+        transferSignerOpts
       )
     );
 
@@ -574,7 +581,12 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
 
     console.log(`⚡ Gas will be ${paymasterToken ? `paid with ${paymasterToken} tokens via ERC-20 paymaster` : 'sponsored by paymaster'}`);
 
-    // Execute universal transaction with circuit breaker
+    // Execute universal transaction with circuit breaker.
+    // Phase 1: pass envelope + KMS ARN for enclave routing.
+    const universalSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    const universalBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof universalBlob === "string") universalSignerOpts.envelopeBlob = universalBlob;
+    if (process.env.KMS_KEY_ARN) universalSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         chainId,
@@ -583,7 +595,8 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
         ownerPrivateKey,
         bundlerUrl,
         paymasterRPC,
-        paymasterToken
+        paymasterToken,
+        universalSignerOpts
       )
     );
 
@@ -1170,7 +1183,12 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
     }
 
     // Execute bridge via smart account with ERC-20 paymaster (gas paid in the bridged token)
+    // Phase 1: pass envelope + KMS ARN for enclave routing.
     console.log(`🚀 Executing bridge transaction via smart account...`);
+    const bridgeSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    const bridgeBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof bridgeBlob === "string") bridgeSignerOpts.envelopeBlob = bridgeBlob;
+    if (process.env.KMS_KEY_ARN) bridgeSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         sourceChainId,
@@ -1179,7 +1197,8 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
         ownerPrivateKey,
         chainConfig.bundlerUrl,
         chainConfig.paymasterRPC,
-        tokenAddress // pay gas in the token being bridged
+        tokenAddress, // pay gas in the token being bridged
+        bridgeSignerOpts
       )
     );
 

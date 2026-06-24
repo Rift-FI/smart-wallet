@@ -52,8 +52,14 @@ export async function resolveOwnerKey(
 
     const plaintext = await decryptKey(encrypted);
     body.ownerPrivateKey = plaintext;
-    // Don't leak the encrypted blob into downstream logging.
-    delete body.ownerEncryptedKey;
+    // Phase 1: KEEP the envelope blob on the body so the route handler
+    // can forward it to the enclave when SIGNING_MODE=enclave. In local
+    // mode this is just untouched and the route ignores it. The
+    // makeSigner factory reads both — plaintext for local-mode signing
+    // and address derivation, envelope blob for enclave-mode signing.
+    // Logging concern: don't log `ownerEncryptedKey` in this service's
+    // request logs. The blob is opaque without KMS but still ends up in
+    // CloudTrail noise if leaked.
 
     next();
   } catch (err: any) {

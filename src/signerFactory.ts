@@ -33,8 +33,6 @@ import {
   type LocalAccount,
   type SignableMessage,
   hashMessage,
-  hexToBytes,
-  toBytes,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { isEnclaveMode, signWithEnclave } from "./signingMode";
