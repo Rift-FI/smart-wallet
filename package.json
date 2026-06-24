@@ -17,6 +17,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.1075.0",
     "@walletconnect/core": "^2.23.7",
     "@walletconnect/web3wallet": "^1.16.1",
     "compression": "^1.7.4",

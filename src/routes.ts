@@ -6,10 +6,11 @@ import { estimateTransfer } from './estimateTransfer';
 import { estimateBridge } from './estimateBridge';
 import { getAcrossQuote, buildBridgeCalls } from './bridge';
 import { pairAndApprove, disconnectSession, getActiveSessions, getPendingRequests, approveRequest, rejectRequest } from './walletconnect';
-import { 
+import {
   RateLimiter,
   CircuitBreaker
 } from './utils';
+import { resolveOwnerKey } from './middleware/resolveOwnerKey';
 import { ethers } from 'ethers';
 import { CHAINS } from './abstraction';
 import { privateKeyToAccount } from "viem/accounts";
@@ -20,6 +21,13 @@ import {
 import { toSafeSmartAccount } from 'permissionless/accounts';
 
 const router = Router();
+
+// Resolves the EOA key from EITHER `ownerPrivateKey` (legacy: backend
+// posts plaintext over HTTPS) OR `ownerEncryptedKey` (Phase 0.5: backend
+// posts the envelope blob, this middleware KMS-decrypts it in-process).
+// Routes downstream all read `ownerPrivateKey` regardless, so they don't
+// know which path the caller used.
+router.use(resolveOwnerKey);
 
 const SUPPORTED_CHAINS_LIST = 'Ethereum (1), Base (8453), Polygon (137), Celo (42220), Arbitrum (42161), Avalanche (43114), BSC (56), Berachain (80094)';
 
