@@ -13,16 +13,18 @@ A production-ready TypeScript Express server that enables **gasless token transf
 - **Multi-chain Support**: Base, Polygon, Celo, and 100+ EVM chains
 - **Universal API**: Single `/api/transfer` endpoint for all chains — same request format regardless of chain
 - **Production Ready**: Rate limiting, circuit breakers, error handling
+- **KMS Envelope Encryption**: Optionally accepts `ownerEncryptedKey` (envelope blob) instead of `ownerPrivateKey`. The service decrypts in-process via AWS KMS — plaintext keys never have to cross HTTPS. See [KMS Envelope Encryption](#-kms-envelope-encryption) below.
 
 ## 🏗️ How It Works
 
-1. **User submits transfer** with private key + token details
-2. **Smart account created** deterministically (same address across chains)
-3. **Paymaster sponsors gas** using user's tokens:
+1. **Caller submits transfer** with EOA key material (either plaintext `ownerPrivateKey` OR envelope-encrypted `ownerEncryptedKey`) + token details
+2. **`resolveOwnerKey` middleware** unwraps the envelope via AWS KMS when present, so downstream handlers always see a plaintext `ownerPrivateKey` in memory
+3. **Smart account created** deterministically (same address across chains) — Safe 1.4.1 via the `permissionless` SDK
+4. **Paymaster sponsors gas** using user's tokens:
    - **Most chains**: Pimlico ERC-20 paymaster
    - **Celo**: Custom `Erc20Paymaster` verifying paymaster + Pimlico bundler (see [CELO_PAYMASTER.md](CELO_PAYMASTER.md))
-4. **Transaction executed** instantly, returns UserOperation hash
-5. **User tracks** transaction on block explorer
+5. **Transaction executed** instantly, returns UserOperation hash
+6. **Caller tracks** transaction on block explorer
 
 > **Note**: The API interface is identical for all chains. Celo uses a custom paymaster behind the scenes, but callers send the exact same request body and receive the same response format.
 
@@ -65,6 +67,21 @@ CELO_PAYMASTER_OWNER_KEY=your_celo_paymaster_owner_private_key
 # Development settings
 NODE_ENV=development
 PORT=3000
+
+# ── KMS envelope encryption (see "KMS Envelope Encryption" section below) ──
+# Required when callers send `ownerEncryptedKey` instead of `ownerPrivateKey`.
+# Without these, the service still works — it just falls back to the plaintext
+# field. Reuse the same IAM user the backend uses (rift-backend-kms in our
+# infra); permissions needed: kms:Decrypt on both prod and sandbox CMKs.
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+
+# Optional: needed only when callers might send legacy AES blobs
+# (pre-envelope rows that haven't been migrated yet). Same value as
+# the backend's ENCRYPTION_KEY env. Drop this once every row in
+# encrypted_keys is in `enc:v1:` format.
+ENCRYPTION_KEY=...
 ```
 
 ### 3. Start Development Server
@@ -82,14 +99,28 @@ Server runs on `http://localhost:3000`
 
 Transfer any ERC-20 token on any supported chain with gas paid in tokens.
 
+Two equivalent key-material options — see the [KMS Envelope Encryption](#-kms-envelope-encryption) section for which to prefer:
+
 ```json
+// Envelope path (preferred — plaintext never leaves the caller's process or KMS)
+{
+  "chainId": 137,
+  "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+  "recipient": "0xRecipientAddress",
+  "amount": 1.5,
+  "ownerEncryptedKey": "enc:v1:AQIDAHhZ8uEMe.../...:abc...:def...",
+  "ownerAddress": "0xYourAddress",
+  "rpcUrl": "https://polygon-rpc.com"
+}
+
+// Plaintext path (still supported — kept for backwards compatibility)
 {
   "chainId": 137,
   "tokenAddress": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
   "recipient": "0xRecipientAddress",
   "amount": 1.5,
   "ownerPrivateKey": "0xYourPrivateKey",
-  "ownerAddress": "0xYourAddress", 
+  "ownerAddress": "0xYourAddress",
   "rpcUrl": "https://polygon-rpc.com"
 }
 ```
@@ -244,6 +275,110 @@ scripts/
 - **Private Key Verification**: Ensures key matches address
 - **Error Handling**: Graceful error responses
 - **CORS**: Configurable cross-origin protection
+- **KMS Envelope Decryption**: When callers send `ownerEncryptedKey`, plaintext keys never cross HTTPS — see below
+
+## 🔐 KMS Envelope Encryption
+
+> ✅ **Validated end-to-end in production**: real offramp executed successfully against a user whose `encrypted_keys` row had been migrated to the envelope format. Full chain — backend KMS decrypt → smart-wallet KMS decrypt → Safe signing → on-chain settlement — works.
+
+### Why
+
+The original API contract required the caller to send `ownerPrivateKey` (plaintext) over HTTPS. Even with TLS, that meant the plaintext EOA key sat in:
+
+- the backend's HTTP response context after decrypting from DB
+- the smart-wallet's request body / Express middleware chain
+- any LB / CDN / proxy logging the body
+- request-debug breakpoints anywhere on the network path
+
+A single misconfigured proxy or accidental log line would leak key material. After Phase 0.5, the HTTPS body carries an opaque envelope blob; the smart-wallet decrypts it in-process via KMS just before signing, then the plaintext lives in memory for the duration of the signing call only.
+
+### What changed in this repo
+
+| File | Purpose |
+|---|---|
+| `src/kms.ts` | AWS KMS client — Decrypt only. KeyId is intentionally not pinned; KMS infers the CMK from the ciphertext metadata, so the same code handles production and sandbox CMKs without mode awareness here. |
+| `src/keyEncryption.ts` | `decryptKey(blob)` — detects `enc:v1:` prefix → KMS path; otherwise falls back to legacy AES under `ENCRYPTION_KEY`. Byte-for-byte mirror of the backend's `utils/keyEncryption.ts`. |
+| `src/middleware/resolveOwnerKey.ts` | Mounted at the router root. If `body.ownerEncryptedKey` is present, decrypts it and writes `body.ownerPrivateKey` so the 8 existing route handlers don't need code changes. If only `ownerPrivateKey` is present, it's a no-op. |
+
+### Envelope format
+
+Same column on the backend (`encrypted_keys.encrypted_keys`) carries either format; the prefix distinguishes them:
+
+```
+Legacy (pre-Phase 0):
+  <iv_hex>:<ciphertext_hex>
+  AES-256-CBC, key = sha256(ENCRYPTION_KEY)
+
+Envelope (Phase 0 onwards):
+  enc:v1:<wrapped_dek_b64>:<iv_hex>:<ciphertext_hex>
+  - wrapped_dek_b64: AWS KMS-wrapped 256-bit DEK
+  - iv_hex: 16 random bytes
+  - ciphertext_hex: AES-256-CBC of the plaintext private key under that DEK
+```
+
+### Request shape — caller's options
+
+The API accepts EITHER field; the middleware figures out which path to take. Backwards-compatible by design so backend + smart-wallet can be deployed in any order.
+
+```jsonc
+// New: envelope path (preferred)
+{
+  "chainId": 137,
+  "ownerEncryptedKey": "enc:v1:AQIDAHhZ8uEMe.../...:abc...:def...",
+  "ownerAddress": "0x...",
+  // ... rest unchanged
+}
+
+// Legacy: plaintext path (still works)
+{
+  "chainId": 137,
+  "ownerPrivateKey": "0xac09...",
+  "ownerAddress": "0x...",
+  // ... rest unchanged
+}
+```
+
+If both are present, `ownerPrivateKey` wins (treated as legacy caller). Drop the plaintext field from your client once you've verified the envelope path works.
+
+### Threat model — before vs after
+
+| Failure mode | Before Phase 0.5 | After |
+|---|---|---|
+| Misconfigured proxy logs request bodies | Plaintext key in logs | Opaque envelope; useless without KMS |
+| Stale CDN response cache | Plaintext leaks | Opaque envelope leaks |
+| Compromised backend env (`ENCRYPTION_KEY` leaks) | Drains every user in the DB | No-op — KMS access also required |
+| Stolen backend → smart-wallet HTTPS pcap | Plaintext key extracted | Envelope extracted; useless without KMS |
+| Smart-wallet host root compromise | Plaintext keys in memory | Plaintext keys in memory (TEE work required to close this — Phase 1) |
+
+The remaining attack — root on the smart-wallet host — is what AWS Nitro Enclaves or confidential VMs would close. That's Phase 1 territory; for Phase 0.5 the network/at-rest gaps are eliminated.
+
+### Where the IAM permissions live
+
+The smart-wallet reuses the same IAM user the backend uses (`rift-backend-kms` in our infra). The policy attached to that user:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowKmsEnvelopeOps",
+    "Effect": "Allow",
+    "Action": ["kms:Encrypt", "kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+    "Resource": [
+      "arn:aws:kms:us-east-1:<ACCOUNT_ID>:key/<prod-key-uuid>",
+      "arn:aws:kms:us-east-1:<ACCOUNT_ID>:key/<sandbox-key-uuid>"
+    ]
+  }]
+}
+```
+
+The smart-wallet only ever uses `kms:Decrypt`; the broader policy is fine because the same IAM user is shared with the backend (which does need `Encrypt` and `GenerateDataKey` for the migration script and new-user signups).
+
+### Operational notes
+
+- **Latency**: each `decryptKey()` call adds ~30-80ms (KMS round-trip + region latency). Subsequent calls in the same Node process don't get cached — KMS is hit on every decrypt by design (so revoking IAM at AWS instantly stops signing without a code change here).
+- **CloudTrail**: every decrypt is logged in AWS CloudTrail with the caller's IAM principal, the CMK used, and the request ID. Look there if you ever need to forensically reconstruct which keys were unwrapped when.
+- **Multi-region**: the CMKs are single-region (us-east-1). If the smart-wallet ever runs outside us-east-1 the KMS calls cross regions and pay the round-trip; consider multi-region keys at that point.
+- **Wipe-after-use**: the unwrapped DEK is filled with zeros in a `finally` block after each decrypt to shrink the in-memory plaintext lifetime as much as the runtime allows.
 
 ## 🚀 Production Deployment
 
