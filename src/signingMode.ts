@@ -1,91 +1,144 @@
 /**
- * Per-process signing-mode selector.
+ * Per-process signing-mode selector + parent-proxy HTTP client.
  *
- * Phase 1.0 plumbing. The smart-wallet has historically signed every
- * UserOperation in-process by passing a viem `privateKeyToAccount(pk)`
- * directly to `toSafeSmartAccount`. The plaintext key lives in this
- * Node process's memory for the duration of the request.
+ * Phase 1 — the smart-wallet runs on the EC2 host (NOT inside the
+ * enclave) and delegates the actual signing primitive to the enclave
+ * via the parent-proxy. The parent-proxy listens on
+ * http://127.0.0.1:7777 (set via PARENT_PROXY_URL).
  *
- * Phase 1 introduces a second mode: signing happens INSIDE a Nitro
- * Enclave. The smart-wallet builds the UserOp + hash in-process (no
- * key material involved), then asks the enclave to sign the hash
- * over a vsock socket. The plaintext key only ever exists in the
- * enclave's encrypted RAM.
+ * Flow when SIGNING_MODE=enclave:
+ *   1. Smart-wallet builds the UserOp + computes the Safe-specific hash
+ *      (no key material involved — pure encoding).
+ *   2. Smart-wallet POSTs to parent-proxy: {user_op_hash_hex, envelope,
+ *      kms_key_arn}.
+ *   3. Parent-proxy forwards over vsock to the enclave.
+ *   4. Enclave KMS-attests, RSA-OAEP unwraps the DEK, AES-decrypts the
+ *      envelope, secp256k1 signs, returns the 65-byte signature.
+ *   5. Parent-proxy returns the signature over HTTP.
  *
- * Selecting the mode is a single env var:
- *   SIGNING_MODE=local      → today's behaviour (default)
- *   SIGNING_MODE=enclave    → routes signature requests to the enclave
- *
- * Backwards compatibility: SIGNING_MODE=enclave is a SUPERSET of local
- * behaviour during the rollout. If the enclave is unreachable or the
- * vsock client throws, the signer transparently falls back to local
- * signing so signing can't be hard-broken by a misconfigured enclave.
- * This shim disappears once we've proven enclave signing in production
- * for ~30 days.
- *
- * Currently the enclave routing is STUBBED — see `signWithEnclave`
- * below. The TODO marker is where the vsock client plugs in.
+ * Backwards-compat: if SIGNING_MODE=local (default) or the
+ * parent-proxy is unreachable, signWithEnclave returns null and the
+ * caller falls back to signing with the plaintext key in-process —
+ * same behaviour as today.
  */
 
 import type { Hex } from "viem";
 
 export type SigningMode = "local" | "enclave";
 
-/**
- * Read the mode live from env, so test setup that flips env vars in
- * beforeEach actually takes effect without re-importing.
- */
+const PARENT_PROXY_URL =
+  process.env.PARENT_PROXY_URL || "http://127.0.0.1:7777";
+
+// Live env read so tests can override SIGNING_MODE per case.
 export function getSigningMode(): SigningMode {
   const raw = (process.env.SIGNING_MODE || "").trim().toLowerCase();
-  if (raw === "enclave") return "enclave";
-  return "local";
+  return raw === "enclave" ? "enclave" : "local";
 }
 
-/** Quick lookup that doesn't allocate a string. */
 export function isEnclaveMode(): boolean {
   return getSigningMode() === "enclave";
 }
 
-/**
- * Log the signing-mode decision at process boot. Useful in CloudWatch
- * to confirm a deployed instance is in the mode you expected.
- */
 export function logSigningModeOnStartup(): void {
   const mode = getSigningMode();
   console.log(`[signingMode] this instance is running in '${mode}' mode`);
   if (mode === "enclave") {
-    console.log("[signingMode] enclave path is currently stubbed → falls through to local signing");
-    console.log("[signingMode] when vsock client is wired (next commit), Safe UserOp hashes route to the Nitro enclave");
+    console.log(`[signingMode] enclave signing via parent-proxy at ${PARENT_PROXY_URL}`);
   }
 }
 
 /**
- * Stub for the enclave signing call.
- *
- * Returns `null` when the enclave path isn't implemented (or fails).
- * Callers see `null` and fall back to local signing, preserving today's
- * behaviour in `enclave` mode until the real vsock client lands.
- *
- * TODO(rift-1.1): replace this body with:
- *   1. open vsock connection (or HTTP-over-vsock-proxy) to enclave on
- *      port 5005
- *   2. send length-prefixed JSON SignRequest:
- *        { user_op_hash_hex, wrapped_dek_b64, ciphertext_hex, iv_hex,
- *          kms_key_arn }
- *   3. read SignResponse, return Ok.signature_hex
- *   4. on any error: log + return null (caller falls back to local)
- *
- * The enclave's protocol is defined in the rift-signer-enclave repo
- * (src/protocol.rs).
+ * Pre-parsed envelope blob suitable for sending to the enclave.
+ * Backend stores blobs as `enc:v1:<wrapped_dek_b64>:<iv_hex>:<ciphertext_hex>`.
  */
-export async function signWithEnclave(_params: {
-  userOpHashHex: Hex;
+export interface EnvelopeParts {
   wrappedDekB64: string;
-  ciphertextHex: string;
   ivHex: string;
+  ciphertextHex: string;
+}
+
+/**
+ * Parse the backend's envelope format into its three components.
+ * Returns null when the input isn't an envelope blob (legacy AES
+ * format starts with `<iv_hex>:<ciphertext_hex>` and has no prefix).
+ */
+export function parseEnvelope(blob: string): EnvelopeParts | null {
+  const prefix = "enc:v1:";
+  if (!blob.startsWith(prefix)) return null;
+  const rest = blob.slice(prefix.length);
+  const firstColon = rest.indexOf(":");
+  const secondColon = rest.indexOf(":", firstColon + 1);
+  if (firstColon === -1 || secondColon === -1) return null;
+  return {
+    wrappedDekB64: rest.slice(0, firstColon),
+    ivHex: rest.slice(firstColon + 1, secondColon),
+    ciphertextHex: rest.slice(secondColon + 1),
+  };
+}
+
+/**
+ * Sign a Safe UserOp hash by routing through the parent-proxy → enclave.
+ *
+ * Returns the 65-byte Ethereum-canonical signature as 0x-prefixed hex,
+ * or `null` when:
+ *   - SIGNING_MODE is not "enclave" (caller signs locally)
+ *   - the envelope blob isn't in `enc:v1:` format (no DEK to unwrap)
+ *   - the parent-proxy is unreachable / returns an error (graceful
+ *     fallback to local signing during the rollout window)
+ *
+ * The HTTP call has a 30-second timeout; the enclave's RSA key
+ * generation is the slowest step (~50-200ms on Graviton) but the
+ * generous timeout keeps us robust against the occasional cold-start.
+ */
+export async function signWithEnclave(params: {
+  userOpHashHex: Hex;
+  envelopeBlob: string;
   kmsKeyArn: string;
 }): Promise<Hex | null> {
   if (!isEnclaveMode()) return null;
-  // TODO(rift-1.1): wire vsock client.
-  return null;
+  const parts = parseEnvelope(params.envelopeBlob);
+  if (!parts) {
+    console.warn(
+      "[signingMode] envelope blob is not in enc:v1: format — falling back to local signing"
+    );
+    return null;
+  }
+
+  const body = {
+    user_op_hash_hex: params.userOpHashHex,
+    wrapped_dek_b64: parts.wrappedDekB64,
+    iv_hex: parts.ivHex,
+    ciphertext_hex: parts.ciphertextHex,
+    kms_key_arn: params.kmsKeyArn,
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const response = await fetch(`${PARENT_PROXY_URL}/sign`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "<no body>");
+      console.error(
+        `[signingMode] parent-proxy returned ${response.status}: ${text}`
+      );
+      return null;
+    }
+    const json = (await response.json()) as { signature_hex?: string };
+    if (!json.signature_hex) {
+      console.error("[signingMode] parent-proxy response had no signature_hex");
+      return null;
+    }
+    return json.signature_hex as Hex;
+  } catch (err: any) {
+    console.error(`[signingMode] parent-proxy call failed: ${err?.message || err}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
