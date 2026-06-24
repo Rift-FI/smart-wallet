@@ -116,9 +116,21 @@ export async function signWithEnclave(params: {
   const timer = setTimeout(() => controller.abort(), 30_000);
 
   try {
+    // Build headers. When PARENT_PROXY_AUTH_TOKEN is set in env, send
+    // the matching Bearer token — the parent-proxy on the EC2 will
+    // 401 anything else, so this is the gate that keeps random
+    // internet from hitting the public /sign endpoint.
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+    };
+    const proxyToken = process.env.PARENT_PROXY_AUTH_TOKEN;
+    if (proxyToken) {
+      headers["authorization"] = `Bearer ${proxyToken}`;
+    }
+
     const response = await fetch(`${PARENT_PROXY_URL}/sign`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
