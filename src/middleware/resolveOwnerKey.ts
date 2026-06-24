@@ -50,16 +50,25 @@ export async function resolveOwnerKey(
       return next();
     }
 
+    // Phase 1 no-key path: in enclave mode we DO NOT decrypt here.
+    // The route handler builds a viem signer that only knows the
+    // owner address; signing happens inside the Nitro enclave. The
+    // plaintext private key NEVER enters this process's memory.
+    //
+    // The blob stays on the body so the route can forward it to the
+    // enclave via the parent-proxy.
+    if ((process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave") {
+      // Sanity: backend must also pass `ownerAddress`. Backend's
+      // signatureController/bridgeController/erc20_transfer all do —
+      // if they don't, the route returns 400 cleanly.
+      return next();
+    }
+
+    // Local mode: decrypt and stamp plaintext for the legacy signing path.
     const plaintext = await decryptKey(encrypted);
     body.ownerPrivateKey = plaintext;
-    // Phase 1: KEEP the envelope blob on the body so the route handler
-    // can forward it to the enclave when SIGNING_MODE=enclave. In local
-    // mode this is just untouched and the route ignores it. The
-    // makeSigner factory reads both — plaintext for local-mode signing
-    // and address derivation, envelope blob for enclave-mode signing.
-    // Logging concern: don't log `ownerEncryptedKey` in this service's
-    // request logs. The blob is opaque without KMS but still ends up in
-    // CloudTrail noise if leaked.
+    // Keep the envelope blob on the body too so the route handler can
+    // still forward it (a tiny harmless redundancy in local mode).
 
     next();
   } catch (err: any) {

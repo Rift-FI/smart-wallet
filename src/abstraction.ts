@@ -73,7 +73,7 @@ export const submitTransaction = async (
   /** Project's own treasury address (required when projectMarkupBps > 0). */
   projectTreasuryAddress?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn">
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress">
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -116,10 +116,14 @@ export const submitTransaction = async (
       },
     });
 
-    // Create signer from private key
-    const signerOpts: SignerOptions = { privateKey: ownerPrivateKey };
+    // Build signer options. In enclave mode + ownerAddress provided,
+    // makeSigner takes the no-key path and `ownerPrivateKey` is
+    // ignored (it's typically "" or unset in that case).
+    const signerOpts: SignerOptions = {};
+    if (ownerPrivateKey) signerOpts.privateKey = ownerPrivateKey;
     if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
     if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
+    if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 
@@ -414,7 +418,7 @@ export const submitUniversalTransaction = async (
   paymasterRPC: string,
   paymasterToken?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn">,
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress">,
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -461,10 +465,14 @@ export const submitUniversalTransaction = async (
       },
     });
 
-    // Create signer from private key
-    const signerOpts: SignerOptions = { privateKey: ownerPrivateKey };
+    // Build signer options. In enclave mode + ownerAddress provided,
+    // makeSigner takes the no-key path and `ownerPrivateKey` is
+    // ignored (it's typically "" or unset in that case).
+    const signerOpts: SignerOptions = {};
+    if (ownerPrivateKey) signerOpts.privateKey = ownerPrivateKey;
     if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
     if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
+    if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 

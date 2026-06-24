@@ -133,12 +133,23 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       projectTreasuryAddress
     } = req.body as UniversalTransferBody;
 
-    // Validate required fields
-    if (!chainId || !tokenAddress || !recipient || !amount || !ownerPrivateKey || !ownerAddress || !rpcUrl) {
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
+    if (!chainId || !tokenAddress || !recipient || !amount || !keyMaterialOk || !ownerAddress || !rpcUrl) {
       res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: chainId, tokenAddress, recipient, amount, ownerPrivateKey, ownerAddress, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: chainId, tokenAddress, recipient, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: chainId, tokenAddress, recipient, amount, ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -228,12 +239,18 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
     console.log(`⚡ Gas will be sponsored by ERC-20 paymaster using user's tokens`);
 
     // Execute transfer with circuit breaker.
-    // Phase 1: pass through the envelope blob + KMS ARN so makeSigner
-    // can route signing to the enclave when SIGNING_MODE=enclave.
-    const transferSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    // Phase 1: pass through the envelope blob + KMS ARN + ownerAddress
+    // so makeSigner can route to the enclave's no-key path (plaintext
+    // never enters this Node process when SIGNING_MODE=enclave).
+    const transferSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+    } = {};
     const transferBlob = (req.body as any).ownerEncryptedKey;
     if (typeof transferBlob === "string") transferSignerOpts.envelopeBlob = transferBlob;
     if (process.env.KMS_KEY_ARN) transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    transferSignerOpts.ownerAddress = ownerAddress;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitTransaction(
         chainId,
@@ -582,11 +599,16 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
     console.log(`⚡ Gas will be ${paymasterToken ? `paid with ${paymasterToken} tokens via ERC-20 paymaster` : 'sponsored by paymaster'}`);
 
     // Execute universal transaction with circuit breaker.
-    // Phase 1: pass envelope + KMS ARN for enclave routing.
-    const universalSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    // Phase 1: pass envelope + KMS ARN + ownerAddress for enclave no-key routing.
+    const universalSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+    } = {};
     const universalBlob = (req.body as any).ownerEncryptedKey;
     if (typeof universalBlob === "string") universalSignerOpts.envelopeBlob = universalBlob;
     if (process.env.KMS_KEY_ARN) universalSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    if (ownerAddress) universalSignerOpts.ownerAddress = ownerAddress;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         chainId,
@@ -1183,12 +1205,17 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
     }
 
     // Execute bridge via smart account with ERC-20 paymaster (gas paid in the bridged token)
-    // Phase 1: pass envelope + KMS ARN for enclave routing.
+    // Phase 1: pass envelope + KMS ARN + ownerAddress for enclave no-key routing.
     console.log(`🚀 Executing bridge transaction via smart account...`);
-    const bridgeSignerOpts: { envelopeBlob?: string; kmsKeyArn?: string } = {};
+    const bridgeSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+    } = {};
     const bridgeBlob = (req.body as any).ownerEncryptedKey;
     if (typeof bridgeBlob === "string") bridgeSignerOpts.envelopeBlob = bridgeBlob;
     if (process.env.KMS_KEY_ARN) bridgeSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    if (ownerAddress) bridgeSignerOpts.ownerAddress = ownerAddress;
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         sourceChainId,
