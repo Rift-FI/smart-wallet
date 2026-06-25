@@ -177,26 +177,32 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+    // Verify owner address matches private key — local mode only. In
+    // enclave mode the plaintext key never enters this process so
+    // there's nothing to verify against; `ownerAddress` is taken on
+    // trust (parent-proxy /sign produces a signature recoverable to
+    // that address, or fails).
+    if (!inEnclaveMode) {
+      try {
+        const wallet = new ethers.Wallet(ownerPrivateKey);
+        if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+          res.status(400).json({
+            success: false,
+            error: 'Authentication Error',
+            message: 'Private key does not match owner address',
+            timestamp: new Date().toISOString(),
+          } as any);
+          return;
+        }
+      } catch (error) {
         res.status(400).json({
           success: false,
-          error: 'Authentication Error',
-          message: 'Private key does not match owner address',
+          error: 'Validation Error',
+          message: 'Invalid private key format',
           timestamp: new Date().toISOString(),
         } as any);
         return;
       }
-    } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      } as any);
-      return;
     }
 
     // Get bundler and paymaster URLs based on chainId
@@ -462,12 +468,24 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       paymasterToken
     } = req.body as UniversalTransactionBody;
 
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
     // Validate required fields
-    if (!chainId || !calls || !Array.isArray(calls) || calls.length === 0 || !ownerPrivateKey || !ownerAddress || !rpcUrl) {
+    if (!chainId || !calls || !Array.isArray(calls) || calls.length === 0 || !keyMaterialOk || !ownerAddress || !rpcUrl) {
       res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: chainId, calls (non-empty array), ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -540,26 +558,32 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+    // Verify owner address matches private key — local mode only. In
+    // enclave mode the plaintext key never enters this process so
+    // there's nothing to verify against; `ownerAddress` is taken on
+    // trust (parent-proxy /sign produces a signature recoverable to
+    // that address, or fails).
+    if (!inEnclaveMode) {
+      try {
+        const wallet = new ethers.Wallet(ownerPrivateKey);
+        if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+          res.status(400).json({
+            success: false,
+            error: 'Authentication Error',
+            message: 'Private key does not match owner address',
+            timestamp: new Date().toISOString(),
+          } as any);
+          return;
+        }
+      } catch (error) {
         res.status(400).json({
           success: false,
-          error: 'Authentication Error',
-          message: 'Private key does not match owner address',
+          error: 'Validation Error',
+          message: 'Invalid private key format',
           timestamp: new Date().toISOString(),
         } as any);
         return;
       }
-    } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      } as any);
-      return;
     }
 
     // Get bundler and paymaster URLs based on chainId
