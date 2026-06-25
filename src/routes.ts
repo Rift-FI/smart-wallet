@@ -709,22 +709,32 @@ router.post('/api/sign',  async (req, res) => {
 
 // ==================== SMART ACCOUNT ENDPOINTS ====================
 
-// Get smart account address endpoint
+// Get smart account address endpoint.
+//
+// Accepts `ownerAddress` (preferred — Phase-2 no-plaintext-on-wire) and
+// falls back to `ownerPrivateKey` for rollout-window compatibility with
+// older backend deploys. The Safe smart-account address is deterministic
+// from JUST the EOA's public address (CREATE2 with keccak256(owner) as
+// salt), so we never need the private key to compute it.
 router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
   try {
-    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body as {
+      chainId?: number;
+      ownerPrivateKey?: string;
+      ownerAddress?: string;
+      rpcUrl?: string;
+    };
+    let { ownerAddress } = req.body as { ownerAddress?: string };
 
-    // Validate required fields - we need private key to deterministically calculate address
-    if (!chainId || !ownerPrivateKey) {
+    if (!chainId || (!ownerAddress && !ownerPrivateKey)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'chainId and ownerPrivateKey are required',
+        message: 'chainId and ownerAddress (or legacy ownerPrivateKey) are required',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Validate chain support
     const chain = CHAINS[chainId as keyof typeof CHAINS];
     if (!chain) {
       return res.status(400).json({
@@ -735,20 +745,29 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key format
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      console.log(`👤 Owner address: ${wallet.address}`);
-    } catch (error) {
+    // Derive ownerAddress from ownerPrivateKey only if the caller didn't
+    // give us one directly. This is the rollout shim — it goes away
+    // once every backend deploy is sending `ownerAddress`.
+    if (!ownerAddress) {
+      try {
+        ownerAddress = new ethers.Wallet(ownerPrivateKey as string).address;
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format (legacy field) — prefer `ownerAddress`',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Use provided RPC URL or default
     const defaultRpcUrls: Record<number, string> = {
       1: 'https://eth.llamarpc.com',
       8453: 'https://mainnet.base.org',
@@ -761,23 +780,37 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
     };
     const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
 
-    console.log(`🔍 Getting smart account address on chain ${chainId}`);
+    console.log(`🔍 Getting smart account address on chain ${chainId} for owner ${ownerAddress}`);
 
-    // Create public client
     const publicClient = createPublicClient({
       transport: http(finalRpcUrl),
-      chain
+      chain,
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
-    console.log(`👤 Owner address: ${signer.address}`);
-    
-    // Create Safe smart account to get the deterministic address
+    // No-key signer — viem's toAccount() lets us hand permissionless a
+    // signer object that knows its address but refuses to sign. The
+    // Safe SDK only needs `signer.address` to compute the deterministic
+    // smart-account address.
+    const viewOnlySigner = {
+      address: ownerAddress as `0x${string}`,
+      signMessage: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      signTransaction: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      signTypedData: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      source: 'view-only',
+      type: 'local',
+      publicKey: '0x' as `0x${string}`,
+    } as any;
+
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
-      owners: [signer],
-      version: "1.4.1"
+      owners: [viewOnlySigner],
+      version: '1.4.1',
     });
 
     console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
@@ -786,12 +819,11 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       success: true,
       data: {
         address: smartAccount.address,
-        chainId: chainId
+        chainId,
       },
       message: `Smart account address retrieved successfully for chain ${chainId}`,
       timestamp: new Date().toISOString(),
     });
-
   } catch (error: any) {
     console.error('Get smart account address error:', error);
     res.status(500).json({
@@ -913,6 +945,11 @@ interface BridgeBody {
   tokenAddress: string;
   amount: number;
   ownerPrivateKey: string;
+  /** Phase-2 envelope-aware path. When the backend sends an envelope blob
+   *  via `ownerEncryptedKey`, it also sends `ownerAddress` so the enclave
+   *  signing path knows whose address to sign for without ever touching
+   *  plaintext. Optional for back-compat with older backend deploys. */
+  ownerAddress?: string;
   rpcUrl: string;
   recipient?: string; // optional, defaults to same smart wallet on dest chain
 }
@@ -1051,6 +1088,7 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       tokenAddress,
       amount,
       ownerPrivateKey,
+      ownerAddress,
       rpcUrl,
       recipient: explicitRecipient
     } = req.body as BridgeBody;
