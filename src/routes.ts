@@ -1403,11 +1403,14 @@ interface BridgeBody {
   destChainId: number;
   tokenAddress: string;
   amount: number;
-  ownerPrivateKey: string;
+  /** Local-mode plaintext key. Mutually exclusive with the enclave-mode
+   *  `ownerEncryptedKey + ownerAddress` pair. Optional now — validation
+   *  picks which path is required based on SIGNING_MODE. */
+  ownerPrivateKey?: string;
   /** Phase-2 envelope-aware path. When the backend sends an envelope blob
    *  via `ownerEncryptedKey`, it also sends `ownerAddress` so the enclave
    *  signing path knows whose address to sign for without ever touching
-   *  plaintext. Optional for back-compat with older backend deploys. */
+   *  plaintext. */
   ownerAddress?: string;
   rpcUrl: string;
   recipient?: string; // optional, defaults to same smart wallet on dest chain
@@ -1552,12 +1555,24 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       recipient: explicitRecipient
     } = req.body as BridgeBody;
 
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (envelope blob, in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
     // Validate required fields
-    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !ownerPrivateKey || !rpcUrl) {
+    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !keyMaterialOk || !rpcUrl) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
         timestamp: new Date().toISOString(),
       });
     }
@@ -1600,25 +1615,47 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key
-    try {
-      new ethers.Wallet(ownerPrivateKey);
-    } catch (error) {
+    // Validate the key material. In local mode the private key must parse;
+    // in enclave mode the address must be well-formed (the envelope is
+    // opaque here and only the enclave can unseal it).
+    if (!inEnclaveMode) {
+      try {
+        new ethers.Wallet(ownerPrivateKey);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress!)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress format',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Compute smart wallet address
+    // Compute smart wallet address. In enclave mode we use the no-key
+    // signer so the plaintext private key never enters this process.
     const publicClient = createPublicClient({
       transport: http(rpcUrl),
       chain: sourceChain
     });
 
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    let signer: any;
+    if (inEnclaveMode) {
+      const { makeSigner } = await import('./signerFactory');
+      signer = await makeSigner({
+        envelopeBlob: (req.body as any).ownerEncryptedKey,
+        kmsKeyArn: process.env.KMS_KEY_ARN || 'unused-for-address-derivation',
+        ownerAddress: ownerAddress!,
+      });
+    } else {
+      signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    }
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
       owners: [signer],
@@ -1778,16 +1815,53 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
 
 // ==================== WALLETCONNECT ENDPOINTS ====================
 
-// Pair with a DApp via WalletConnect URI
+// Pair with a DApp via WalletConnect URI.
+//
+// Accepts EITHER:
+//   - `ownerPrivateKey` (legacy local-mode)
+//   - `ownerEncryptedKey + ownerAddress` (envelope / enclave mode — v3)
+//
+// For v3 wallets, every individual dApp signing request submitted
+// through the resulting session must carry an `authProof` in the
+// /api/walletconnect/requests/:id/approve body. The session itself
+// doesn't store authProof — sessions outlive any single gesture.
 router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
   try {
-    const { uri, ownerPrivateKey, chainId, rpcUrl } = req.body;
+    const {
+      uri,
+      ownerPrivateKey,
+      ownerEncryptedKey,
+      ownerAddress,
+      chainId,
+      rpcUrl,
+    } = req.body as {
+      uri?: string;
+      ownerPrivateKey?: string;
+      ownerEncryptedKey?: string;
+      ownerAddress?: string;
+      chainId?: number;
+      rpcUrl?: string;
+    };
 
-    if (!uri || !ownerPrivateKey || !chainId) {
+    const inEnclaveMode =
+      (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope =
+      typeof ownerEncryptedKey === "string" &&
+      ownerEncryptedKey.length > 0 &&
+      typeof ownerAddress === "string" &&
+      ethers.utils.isAddress(ownerAddress);
+    const hasPrivateKey =
+      typeof ownerPrivateKey === "string" && ownerPrivateKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope || hasPrivateKey)
+      : (hasPrivateKey || hasEnvelope);
+
+    if (!uri || !chainId || !keyMaterialOk) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Required fields: uri, ownerPrivateKey, chainId. Optional: rpcUrl',
+        message:
+          'Required: uri, chainId, and (ownerEncryptedKey + ownerAddress) OR ownerPrivateKey. Optional: rpcUrl.',
         timestamp: new Date().toISOString(),
       });
     }
@@ -1803,16 +1877,20 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key
-    try {
-      new ethers.Wallet(ownerPrivateKey);
-    } catch (error) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      });
+    // Validate the key material that's actually present. Envelope is
+    // opaque here (only the enclave can unseal); for the plaintext path
+    // we sanity-check it parses as a private key.
+    if (hasPrivateKey) {
+      try {
+        new ethers.Wallet(ownerPrivateKey as string);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
     }
 
     // Resolve RPC, bundler, paymaster
@@ -1840,7 +1918,9 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
 
     const result = await pairAndApprove(
       uri,
-      ownerPrivateKey,
+      hasEnvelope
+        ? { ownerEncryptedKey, ownerAddress }
+        : { ownerPrivateKey },
       chainId,
       finalRpcUrl,
       chainConfig.bundlerUrl,
@@ -1943,7 +2023,12 @@ router.post('/api/walletconnect/requests/:id/approve', checkRateLimit, async (re
       });
     }
 
-    const result = await approveRequest(requestId);
+    // v3 (envelope-mode) sessions require an authProof on every approve.
+    // Legacy sessions ignore it. approveRequest enforces this by
+    // checking the session config — we just forward whatever the
+    // client sent.
+    const authProof = (req.body as any)?.authProof;
+    const result = await approveRequest(requestId, authProof);
     if (!result.success) {
       return res.status(404).json({
         success: false,

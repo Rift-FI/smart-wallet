@@ -8,10 +8,24 @@ import { privateKeyToAccount } from "viem/accounts";
 import { toSafeSmartAccount } from "permissionless/accounts";
 import { CHAINS } from "./abstraction";
 import { submitUniversalTransaction } from "./abstraction";
+import { makeSigner } from "./signerFactory";
+import type { AuthProof } from "./signingMode";
 
-// Session store: maps WC topic → user config
+// Session store: maps WC topic → user config.
+//
+// Either `ownerPrivateKey` (legacy local-mode) OR
+// `ownerEncryptedKey + ownerAddress` (envelope / enclave mode). The pair
+// endpoint picks one when the session is established; downstream
+// signing handlers use whichever is present.
+//
+// For v3 (device-bound) wallets, every individual dApp signing request
+// must additionally carry a fresh `authProof` bound to that request's
+// hash. authProof is supplied per-approve call, NOT stored on the
+// session — sessions outlive any single user gesture.
 interface SessionConfig {
-  ownerPrivateKey: string;
+  ownerPrivateKey?: string;
+  ownerEncryptedKey?: string;
+  ownerAddress: string;
   smartWalletAddress: string;
   chainId: number;
   rpcUrl: string;
@@ -142,19 +156,55 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
  * verify against the SMART ACCOUNT address via EIP-1271, not the underlying
  * EOA. permissionless auto-wraps in ERC-6492 if the account isn't deployed.
  */
-async function getSmartAccountForSession(config: SessionConfig) {
+async function getSmartAccountForSession(
+  config: SessionConfig,
+  authProof?: AuthProof
+) {
   const chain = CHAINS[config.chainId as keyof typeof CHAINS];
   if (!chain) throw new Error(`Unsupported chain: ${config.chainId}`);
   const publicClient = createPublicClient({ chain, transport: http(config.rpcUrl) });
-  const owner = privateKeyToAccount(config.ownerPrivateKey as `0x${string}`);
+
+  // Pick the signer based on what the session stored. In envelope mode
+  // the signer routes signMessage / signTypedData through the enclave
+  // via parent-proxy /sign — authProof (when supplied) is closed over so
+  // every signature produced by this signer carries it. For v3 wallets,
+  // authProof is mandatory and the enclave will reject if it's missing.
+  let owner;
+  if (config.ownerEncryptedKey && config.ownerAddress) {
+    const opts: any = {
+      envelopeBlob: config.ownerEncryptedKey,
+      ownerAddress: config.ownerAddress,
+    };
+    if (process.env.KMS_KEY_ARN) opts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    if (authProof) opts.authProof = authProof;
+    owner = await makeSigner(opts);
+  } else if (config.ownerPrivateKey) {
+    owner = privateKeyToAccount(config.ownerPrivateKey as `0x${string}`);
+  } else {
+    throw new Error(
+      "session has neither ownerPrivateKey nor ownerEncryptedKey+ownerAddress"
+    );
+  }
+
   return toSafeSmartAccount({ client: publicClient, owners: [owner], version: "1.4.1" });
 }
 
 async function handleSessionRequest(
   method: string,
   params: any[],
-  config: SessionConfig
+  config: SessionConfig,
+  authProof?: AuthProof
 ): Promise<any> {
+  // Envelope-mode (v3) sessions require an authProof on every dApp
+  // request — the enclave's challenge binding will reject any signature
+  // it didn't see a fresh proof for.
+  const envelopeMode = !!config.ownerEncryptedKey;
+  if (envelopeMode && !authProof) {
+    throw new Error(
+      "v3 (envelope-mode) WalletConnect session requires authProof on every request approval. Pass `authProof: { kind: 'passkey' | 'oidc', ... }` to /api/walletconnect/requests/:id/approve."
+    );
+  }
+
   switch (method) {
     case "eth_sendTransaction": {
       const tx = params[0];
@@ -171,13 +221,27 @@ async function handleSessionRequest(
         data: tx.data || undefined,
       }];
 
+      // submitUniversalTransaction's signerOptions accepts both the
+      // envelope+ownerAddress+authProof bundle and the legacy plaintext
+      // key, so a single call covers both modes.
+      const signerOptions: any = envelopeMode
+        ? {
+            envelopeBlob: config.ownerEncryptedKey,
+            ownerAddress: config.ownerAddress,
+            authProof,
+            ...(process.env.KMS_KEY_ARN ? { kmsKeyArn: process.env.KMS_KEY_ARN } : {}),
+          }
+        : undefined;
+
       const result = await submitUniversalTransaction(
         config.chainId,
         config.rpcUrl,
         calls,
-        config.ownerPrivateKey,
+        config.ownerPrivateKey ?? "",
         config.bundlerUrl,
-        config.paymasterRPC
+        config.paymasterRPC,
+        undefined, // paymasterToken — sponsored
+        signerOptions
       );
 
       if (!result.success) {
@@ -191,7 +255,7 @@ async function handleSessionRequest(
       // params: [message, address]
       const message = params[0];
       console.log(`✍️ personal_sign: ${message.slice(0, 100)}...`);
-      const smartAccount = await getSmartAccountForSession(config);
+      const smartAccount = await getSmartAccountForSession(config, authProof);
       return await smartAccount.signMessage({
         message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
       });
@@ -200,7 +264,7 @@ async function handleSessionRequest(
     case "eth_sign": {
       // params: [address, message]
       const message = params[1];
-      const smartAccount = await getSmartAccountForSession(config);
+      const smartAccount = await getSmartAccountForSession(config, authProof);
       return await smartAccount.signMessage({
         message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
       });
@@ -217,7 +281,7 @@ async function handleSessionRequest(
       const filteredTypes = { ...types };
       delete filteredTypes.EIP712Domain;
 
-      const smartAccount = await getSmartAccountForSession(config);
+      const smartAccount = await getSmartAccountForSession(config, authProof);
       return await smartAccount.signTypedData({
         domain,
         types: filteredTypes,
@@ -250,7 +314,7 @@ async function handleSessionRequest(
  */
 export async function pairAndApprove(
   uri: string,
-  ownerPrivateKey: string,
+  ownerKey: { ownerPrivateKey?: string; ownerEncryptedKey?: string; ownerAddress?: string },
   chainId: number,
   rpcUrl: string,
   bundlerUrl: string,
@@ -268,7 +332,28 @@ export async function pairAndApprove(
   if (!chain) throw new Error(`Unsupported chain ID: ${chainId}`);
 
   const publicClient = createPublicClient({ transport: http(rpcUrl), chain });
-  const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+
+  // Pick the signer based on what the caller supplied. Safe address
+  // derivation only depends on the owner's *address*, so the no-key
+  // signer (envelope mode) is sufficient here even without authProof.
+  let signer: any;
+  let ownerAddress: string;
+  if (ownerKey.ownerEncryptedKey && ownerKey.ownerAddress) {
+    signer = await makeSigner({
+      envelopeBlob: ownerKey.ownerEncryptedKey,
+      kmsKeyArn: process.env.KMS_KEY_ARN || "unused-for-address-derivation",
+      ownerAddress: ownerKey.ownerAddress,
+    });
+    ownerAddress = ownerKey.ownerAddress;
+  } else if (ownerKey.ownerPrivateKey) {
+    signer = privateKeyToAccount(ownerKey.ownerPrivateKey as `0x${string}`);
+    ownerAddress = (signer as any).address;
+  } else {
+    throw new Error(
+      "pairAndApprove: provide either ownerPrivateKey, or ownerEncryptedKey + ownerAddress"
+    );
+  }
+
   const smartAccount = await toSafeSmartAccount({
     client: publicClient,
     owners: [signer],
@@ -323,15 +408,21 @@ export async function pairAndApprove(
     namespaces: approvedNamespaces,
   });
 
-  // Store session config
-  sessions.set(session.topic, {
-    ownerPrivateKey,
+  // Store session config — preserve whichever key shape the caller
+  // gave us so handleSessionRequest can pick the right signing path.
+  // Use exact-optional spread so we only set the fields that exist —
+  // exactOptionalPropertyTypes rejects `undefined` for `string?`.
+  const sessionEntry: SessionConfig = {
+    ownerAddress,
     smartWalletAddress,
     chainId,
     rpcUrl,
     bundlerUrl,
     paymasterRPC,
-  });
+  };
+  if (ownerKey.ownerPrivateKey) sessionEntry.ownerPrivateKey = ownerKey.ownerPrivateKey;
+  if (ownerKey.ownerEncryptedKey) sessionEntry.ownerEncryptedKey = ownerKey.ownerEncryptedKey;
+  sessions.set(session.topic, sessionEntry);
 
   const peerName = session.peer?.metadata?.name || "Unknown DApp";
   const peerUrl = session.peer?.metadata?.url || "";
@@ -392,9 +483,24 @@ export function getPendingRequests(): PendingRequest[] {
 }
 
 /**
- * Approve a pending request — executes it and responds to the DApp
+ * Approve a pending request — executes it and responds to the DApp.
+ *
+ * For v3 (envelope-mode) sessions, `authProof` is REQUIRED. Each
+ * dApp signing request is its own user-consent gesture, so authProof
+ * is passed in per-call (not stored on the session). The enclave will
+ * reject any signature whose challenge/nonce doesn't match the
+ * request's hash, so the proof must be bound to THIS specific
+ * request's hash (the smart-wallet computes it during prepareUserOp
+ * for sendTransaction; for personal_sign it's the EIP-191 digest;
+ * for eth_signTypedData it's the EIP-712 digest).
+ *
+ * Legacy (local-mode) sessions don't need authProof — the plaintext
+ * key in sessionConfig signs locally.
  */
-export async function approveRequest(requestId: number): Promise<{
+export async function approveRequest(
+  requestId: number,
+  authProof?: AuthProof
+): Promise<{
   success: boolean;
   result?: any;
   error?: string;
@@ -408,7 +514,12 @@ export async function approveRequest(requestId: number): Promise<{
   const wallet = await getWeb3Wallet();
 
   try {
-    const result = await handleSessionRequest(pending.method, pending.params, sessionConfig);
+    const result = await handleSessionRequest(
+      pending.method,
+      pending.params,
+      sessionConfig,
+      authProof
+    );
     await wallet.respondSessionRequest({
       topic: pending.topic,
       response: {
