@@ -1251,17 +1251,34 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
   }
 });
 
-// Create smart account endpoint
+// Create smart account endpoint.
+//
+// Accepts EITHER:
+//   - `ownerAddress` (envelope mode — preferred; matches /smart-account/address)
+//   - `ownerPrivateKey` (legacy plaintext — kept for backwards compat)
+//
+// Safe smart-account addresses are CREATE2-deterministic from the EOA's
+// address alone (no key required), so this endpoint should never have
+// required the private key in the first place. Migrating brings it in
+// line with /address — any caller (current backend / older deploys /
+// envelope-only signup) just works.
 router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
   try {
-    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body as {
+      chainId?: number;
+      ownerPrivateKey?: string;
+      ownerAddress?: string;
+      rpcUrl?: string;
+    };
+    let { ownerAddress } = req.body as { ownerAddress?: string };
 
     // Validate required fields
-    if (!chainId || !ownerPrivateKey || !rpcUrl) {
+    if (!chainId || !rpcUrl || (!ownerAddress && !ownerPrivateKey)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'chainId, ownerPrivateKey, and rpcUrl are required',
+        message:
+          'chainId, rpcUrl, and ownerAddress (or legacy ownerPrivateKey) are required',
         timestamp: new Date().toISOString(),
       });
     }
@@ -1277,20 +1294,30 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key format
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      console.log(`👤 Owner address: ${wallet.address}`);
-    } catch (error) {
+    // Derive ownerAddress from ownerPrivateKey only when the caller
+    // didn't give us one directly. Rollout shim — goes away once every
+    // caller sends `ownerAddress`.
+    if (!ownerAddress) {
+      try {
+        ownerAddress = new ethers.Wallet(ownerPrivateKey as string).address;
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress format',
         timestamp: new Date().toISOString(),
       });
     }
 
-    console.log(`🏗️ Creating smart account on chain ${chainId}`);
+    console.log(`🏗️ Creating smart account on chain ${chainId} for owner ${ownerAddress}`);
 
     // Create public client
     const publicClient = createPublicClient({
@@ -1298,14 +1325,30 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       chain
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
-    console.log(`👤 Owner address: ${signer.address}`);
+    // Build a no-key viem account that just carries the address. Safe's
+    // address derivation only needs `owners[0].address`, so we never
+    // actually call signMessage / signTransaction here. If something
+    // accidentally tries to, it'll throw a clear error.
+    const { toAccount } = await import('viem/accounts');
+    const noKeySigner = toAccount({
+      address: ownerAddress as `0x${string}`,
+      async signMessage() {
+        throw new Error(
+          'no-key signer: /smart-account/create does not sign — address derivation only'
+        );
+      },
+      async signTransaction() {
+        throw new Error('no-key signer: /smart-account/create does not sign');
+      },
+      async signTypedData() {
+        throw new Error('no-key signer: /smart-account/create does not sign');
+      },
+    });
 
     // Create Safe smart account
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
-      owners: [signer],
+      owners: [noKeySigner],
       version: "1.4.1"
     });
 
