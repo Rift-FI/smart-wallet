@@ -73,7 +73,7 @@ export const submitTransaction = async (
   /** Project's own treasury address (required when projectMarkupBps > 0). */
   projectTreasuryAddress?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress">
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -124,6 +124,8 @@ export const submitTransaction = async (
     if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
     if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
     if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
+    if (signerOptions?.password) signerOpts.password = signerOptions.password;
+    if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 
@@ -418,7 +420,7 @@ export const submitUniversalTransaction = async (
   paymasterRPC: string,
   paymasterToken?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress">,
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">,
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -473,6 +475,8 @@ export const submitUniversalTransaction = async (
     if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
     if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
     if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
+    if (signerOptions?.password) signerOpts.password = signerOptions.password;
+    if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 

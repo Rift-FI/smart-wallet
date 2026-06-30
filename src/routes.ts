@@ -252,11 +252,23 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       envelopeBlob?: string;
       kmsKeyArn?: string;
       ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
     } = {};
     const transferBlob = (req.body as any).ownerEncryptedKey;
     if (typeof transferBlob === "string") transferSignerOpts.envelopeBlob = transferBlob;
     if (process.env.KMS_KEY_ARN) transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     transferSignerOpts.ownerAddress = ownerAddress;
+    // v2 password (non-custodial). Required if the envelope is v2.
+    const transferPassword = (req.body as any).password;
+    if (typeof transferPassword === "string" && transferPassword.length > 0) {
+      transferSignerOpts.password = transferPassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const transferAuthProof = (req.body as any).authProof;
+    if (transferAuthProof && typeof transferAuthProof === "object") {
+      transferSignerOpts.authProof = transferAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitTransaction(
         chainId,
@@ -628,11 +640,23 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       envelopeBlob?: string;
       kmsKeyArn?: string;
       ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
     } = {};
     const universalBlob = (req.body as any).ownerEncryptedKey;
     if (typeof universalBlob === "string") universalSignerOpts.envelopeBlob = universalBlob;
     if (process.env.KMS_KEY_ARN) universalSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     if (ownerAddress) universalSignerOpts.ownerAddress = ownerAddress;
+    // v2 password (non-custodial). Required if the envelope is v2.
+    const universalPassword = (req.body as any).password;
+    if (typeof universalPassword === "string" && universalPassword.length > 0) {
+      universalSignerOpts.password = universalPassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const universalAuthProof = (req.body as any).authProof;
+    if (universalAuthProof && typeof universalAuthProof === "object") {
+      universalSignerOpts.authProof = universalAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         chainId,
@@ -677,6 +701,374 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
   }
 });
 
+
+// ==================== TWO-PHASE v3 (DEVICE-BOUND) ENDPOINTS ====================
+//
+// v3 envelopes need an authProof whose challenge equals the user_op_hash
+// being signed. Hash isn't known until the user op is built, so the flow
+// is two-step:
+//
+//   1. POST /api/transaction/preview            → user_op_hash + ticket_id
+//   2. (client signs hash with passkey / OIDC)
+//   3. POST /api/transaction/submit-prepared    → submits with authProof
+//
+// Ticket is single-use, 60s TTL. Stateless callers welcome — the ticket
+// is opaque on the wire and only meaningful within this process.
+//
+// v1 / v2 envelopes keep using POST /api/transaction (one-phase) since
+// they don't need a challenge bound to the user op hash.
+
+router.post('/api/transaction/preview', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      chainId,
+      calls,
+      ownerEncryptedKey,
+      ownerAddress,
+      rpcUrl,
+    } = req.body as {
+      chainId: number;
+      calls: Array<{ to: string; value?: string; data?: string }>;
+      ownerEncryptedKey: string;
+      ownerAddress: string;
+      rpcUrl: string;
+    };
+
+    if (
+      !chainId ||
+      !Array.isArray(calls) ||
+      calls.length === 0 ||
+      !ownerEncryptedKey ||
+      !ownerAddress ||
+      !rpcUrl
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message:
+          'All fields required: chainId, calls (non-empty), ownerEncryptedKey, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    if (!ethers.utils.isAddress(ownerAddress)) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid owner address',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} not supported. Supported: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const { previewUniversalTransaction } = await import('./twoPhase');
+    const result = await previewUniversalTransaction({
+      chainId,
+      rpcNodeProvider: rpcUrl,
+      calls,
+      ownerAddress,
+      ownerEncryptedKey,
+      bundlerUrl: chainConfig.bundlerUrl,
+      paymasterRPC: chainConfig.paymasterRPC,
+    });
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        user_op_hash_hex: result.userOpHashHex,
+        ticket_id: result.ticketId,
+        expires_at_ms: result.expiresAt,
+        ttl_ms: result.ttlMs,
+        smart_account_address: result.smartAccountAddress,
+        chain_id: chainId,
+      },
+      message: 'User op prepared. Sign user_op_hash_hex with your passkey / OIDC and POST to /api/transaction/submit-prepared.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/transaction/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'preview failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
+
+// Bridge preview — same two-phase pattern, but builds the
+// approve(SpokePool) + depositV3 calls via Across SDK first. Submit
+// uses the shared /api/transaction/submit-prepared (the ticket carries
+// chain + bundler config, no per-flow submit endpoint needed).
+router.post('/api/bridge/preview', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amount,
+      ownerEncryptedKey,
+      ownerAddress,
+      rpcUrl,
+      recipient: explicitRecipient,
+    } = req.body as {
+      sourceChainId: number;
+      destChainId: number;
+      tokenAddress: string;
+      amount: number;
+      ownerEncryptedKey: string;
+      ownerAddress: string;
+      rpcUrl: string;
+      recipient?: string;
+    };
+
+    if (
+      !sourceChainId ||
+      !destChainId ||
+      !tokenAddress ||
+      !amount ||
+      !ownerEncryptedKey ||
+      !ownerAddress ||
+      !rpcUrl
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message:
+          'Required: sourceChainId, destChainId, tokenAddress, amount, ownerEncryptedKey, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    if (sourceChainId === destChainId) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Source and destination chains must differ',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const sourceChain = CHAINS[sourceChainId as keyof typeof CHAINS];
+    if (!sourceChain) {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ID ${sourceChainId} is not supported.`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const chainConfig = getChainConfig(sourceChainId);
+    if (!chainConfig?.bundlerUrl || !chainConfig?.paymasterRPC) {
+      res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster config for chain ${sourceChainId}`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Compute the smart wallet address from ownerAddress (no key needed).
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain: sourceChain,
+    });
+    const { makeSigner } = await import('./signerFactory');
+    const noKeySigner = await makeSigner({
+      envelopeBlob: ownerEncryptedKey,
+      kmsKeyArn: process.env.KMS_KEY_ARN || 'unused-for-address-derivation',
+      ownerAddress,
+    });
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [noKeySigner],
+      version: '1.4.1',
+    });
+    const smartWalletAddress = smartAccount.address;
+    const recipient =
+      explicitRecipient && ethers.utils.isAddress(explicitRecipient)
+        ? explicitRecipient
+        : smartWalletAddress;
+
+    // Token decimals + Across quote.
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function decimals() view returns (uint8)'],
+      new ethers.providers.JsonRpcProvider(rpcUrl)
+    );
+    const decimals = await tokenContract.decimals();
+    const amountInWei = ethers.utils
+      .parseUnits(amount.toString(), decimals)
+      .toString();
+
+    const { getAcrossQuote, buildBridgeCalls } = await import('./bridge');
+    const quote = await getAcrossQuote(
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amountInWei,
+      recipient
+    );
+
+    const bridgeCalls = buildBridgeCalls(
+      quote,
+      smartWalletAddress,
+      recipient,
+      tokenAddress,
+      BigInt(amountInWei),
+      destChainId
+    );
+
+    // Hand to the generic preview — it will run prepareUserOperation
+    // over these ABI-style calls and stash the prepared UO + chain
+    // context in the ticket cache.
+    const { previewUniversalTransaction } = await import('./twoPhase');
+    const previewResult = await previewUniversalTransaction({
+      chainId: sourceChainId,
+      rpcNodeProvider: rpcUrl,
+      calls: bridgeCalls.map((c: any) => ({
+        to: c.to as string,
+        value: c.value !== undefined ? String(c.value) : '0',
+        abi: c.abi,
+        functionName: c.functionName,
+        args: c.args,
+      })) as any,
+      ownerAddress,
+      ownerEncryptedKey,
+      bundlerUrl: chainConfig.bundlerUrl,
+      paymasterRPC: chainConfig.paymasterRPC,
+    });
+
+    if (!previewResult.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: previewResult.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        user_op_hash_hex: previewResult.userOpHashHex,
+        ticket_id: previewResult.ticketId,
+        expires_at_ms: previewResult.expiresAt,
+        ttl_ms: previewResult.ttlMs,
+        smart_account_address: previewResult.smartAccountAddress,
+        chain_id: sourceChainId,
+        // Bridge-specific extras the client may want to display before
+        // the user signs (so they can see what they're approving):
+        bridge: {
+          source_chain_id: sourceChainId,
+          dest_chain_id: destChainId,
+          input_token: tokenAddress,
+          input_amount_wei: amountInWei,
+          output_token: quote.outputToken.address,
+          output_amount_wei: quote.outputAmount,
+          spoke_pool: quote.spokePoolAddress,
+          recipient,
+        },
+      },
+      message:
+        'Bridge UO prepared. Sign user_op_hash_hex with your passkey and POST to /api/transaction/submit-prepared.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/bridge/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'bridge preview failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
+
+router.post('/api/transaction/submit-prepared', checkRateLimit, async (req, res) => {
+  try {
+    const { ticketId, authProof } = req.body as {
+      ticketId?: string;
+      authProof?: {
+        kind: 'oidc' | 'passkey';
+        [k: string]: unknown;
+      };
+    };
+
+    if (!ticketId || !authProof || !authProof.kind) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'ticketId and authProof (with kind=oidc|passkey) are required',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const { submitPreparedUniversalTransaction } = await import('./twoPhase');
+    const result = await submitPreparedUniversalTransaction({
+      ticketId,
+      authProof: authProof as any,
+    });
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Submit Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        userOperationHash: result.userOperationHash,
+        transactionHash: result.transactionHash,
+        chainId: result.chainId,
+      },
+      message: 'User op submitted',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/transaction/submit-prepared] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'submit failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
 
 router.post('/api/sign',  async (req, res) => {
   const {privateKey, chainId, rpcUrl} = req.body;
@@ -1273,11 +1665,22 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       envelopeBlob?: string;
       kmsKeyArn?: string;
       ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
     } = {};
     const bridgeBlob = (req.body as any).ownerEncryptedKey;
     if (typeof bridgeBlob === "string") bridgeSignerOpts.envelopeBlob = bridgeBlob;
     if (process.env.KMS_KEY_ARN) bridgeSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
     if (ownerAddress) bridgeSignerOpts.ownerAddress = ownerAddress;
+    const bridgePassword = (req.body as any).password;
+    if (typeof bridgePassword === "string" && bridgePassword.length > 0) {
+      bridgeSignerOpts.password = bridgePassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const bridgeAuthProof = (req.body as any).authProof;
+    if (bridgeAuthProof && typeof bridgeAuthProof === "object") {
+      bridgeSignerOpts.authProof = bridgeAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         sourceChainId,

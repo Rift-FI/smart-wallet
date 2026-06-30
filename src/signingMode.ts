@@ -76,6 +76,79 @@ export function parseEnvelope(blob: string): EnvelopeParts | null {
   };
 }
 
+export interface EnvelopeV2Parts {
+  wrappedDekB64: string;
+  saltB64: string;
+  nonceHex: string;
+  ciphertextHex: string;
+  tagHex: string;
+}
+
+/**
+ * Parse the Phase-3 v2 envelope format:
+ *   enc:v2:<wrapped_dek_b64>:<salt_b64>:<nonce_hex>:<ciphertext_hex>:<tag_hex>
+ *
+ * v2 binds the encryption key to (KMS DEK XOR HKDF(password, salt)), so
+ * the enclave needs the user's password to decrypt. The smart-wallet
+ * itself never sees the plaintext key in v2 mode — it just forwards.
+ */
+export function parseEnvelopeV2(blob: string): EnvelopeV2Parts | null {
+  const prefix = "enc:v2:";
+  if (!blob.startsWith(prefix)) return null;
+  const parts = blob.slice(prefix.length).split(":");
+  if (parts.length !== 5) return null;
+  return {
+    wrappedDekB64: parts[0],
+    saltB64: parts[1],
+    nonceHex: parts[2],
+    ciphertextHex: parts[3],
+    tagHex: parts[4],
+  };
+}
+
+export interface EnvelopeV3Parts {
+  wrappedDekB64: string;
+  nonceHex: string;
+  ciphertextHex: string;
+  tagHex: string;
+}
+
+/**
+ * Parse the Phase-3 v3 envelope format:
+ *   enc:v3:<wrapped_dek_b64>:<nonce_hex>:<ciphertext_hex>:<tag_hex>
+ *
+ * v3 envelopes are device-bound: the EOA private key + the enrolled
+ * auth methods (Passkey credential IDs / OIDC subjects) are sealed
+ * together under AES-GCM with the KMS-released DEK. Every sign needs
+ * a fresh `authProof` (OIDC id_token bound to the user op hash, or a
+ * WebAuthn assertion challenged with the user op hash). The smart-
+ * wallet never sees the plaintext key — same as v2.
+ */
+export function parseEnvelopeV3(blob: string): EnvelopeV3Parts | null {
+  const prefix = "enc:v3:";
+  if (!blob.startsWith(prefix)) return null;
+  const parts = blob.slice(prefix.length).split(":");
+  if (parts.length !== 4) return null;
+  const [wrappedDekB64, nonceHex, ciphertextHex, tagHex] = parts;
+  if (!wrappedDekB64 || !nonceHex || !ciphertextHex || !tagHex) return null;
+  return { wrappedDekB64, nonceHex, ciphertextHex, tagHex };
+}
+
+/**
+ * Wire shape of a v3 consent proof. Pass-through from the SDK to the
+ * enclave. The smart-wallet never inspects the contents — only the
+ * enclave can verify a JWT or a WebAuthn assertion.
+ */
+export type AuthProof =
+  | { kind: "oidc"; id_token: string }
+  | {
+      kind: "passkey";
+      cred_id_b64: string;
+      client_data_json_b64: string;
+      authenticator_data_b64: string;
+      signature_b64: string;
+    };
+
 /**
  * Sign a Safe UserOp hash by routing through the parent-proxy → enclave.
  *
@@ -94,23 +167,76 @@ export async function signWithEnclave(params: {
   userOpHashHex: Hex;
   envelopeBlob: string;
   kmsKeyArn: string;
+  /** Required for v2 envelopes (password-bound). Ignored for v1 / v3. */
+  password?: string;
+  /** Required for v3 envelopes (device-bound). Ignored for v1 / v2. */
+  authProof?: AuthProof;
 }): Promise<Hex | null> {
   if (!isEnclaveMode()) return null;
-  const parts = parseEnvelope(params.envelopeBlob);
-  if (!parts) {
-    console.warn(
-      "[signingMode] envelope blob is not in enc:v1: format — falling back to local signing"
-    );
-    return null;
-  }
 
-  const body = {
-    user_op_hash_hex: params.userOpHashHex,
-    wrapped_dek_b64: parts.wrappedDekB64,
-    iv_hex: parts.ivHex,
-    ciphertext_hex: parts.ciphertextHex,
-    kms_key_arn: params.kmsKeyArn,
-  };
+  let body: Record<string, unknown>;
+  if (params.envelopeBlob.startsWith("enc:v3:")) {
+    if (!params.authProof) {
+      console.warn(
+        "[signingMode] v3 envelope requires authProof (device-bound). Refusing to call /sign."
+      );
+      return null;
+    }
+    if (params.password) {
+      console.warn(
+        "[signingMode] v3 envelope must not be combined with password — they are mutually exclusive. Refusing."
+      );
+      return null;
+    }
+    // Validate the blob parses so we fail locally, not at the proxy.
+    if (!parseEnvelopeV3(params.envelopeBlob)) {
+      console.warn("[signingMode] malformed enc:v3: blob");
+      return null;
+    }
+    body = {
+      user_op_hash_hex: params.userOpHashHex,
+      v3_envelope_blob: params.envelopeBlob,
+      auth_proof: params.authProof,
+      kms_key_arn: params.kmsKeyArn,
+    };
+  } else if (params.envelopeBlob.startsWith("enc:v2:")) {
+    if (!params.password) {
+      console.warn(
+        "[signingMode] v2 envelope requires a password (non-custodial). Refusing to call /sign."
+      );
+      return null;
+    }
+    const v2 = parseEnvelopeV2(params.envelopeBlob);
+    if (!v2) {
+      console.warn("[signingMode] malformed enc:v2: blob");
+      return null;
+    }
+    body = {
+      user_op_hash_hex: params.userOpHashHex,
+      wrapped_dek_b64: v2.wrappedDekB64,
+      salt_b64: v2.saltB64,
+      nonce_hex: v2.nonceHex,
+      ciphertext_hex: v2.ciphertextHex,
+      tag_hex: v2.tagHex,
+      password: params.password,
+      kms_key_arn: params.kmsKeyArn,
+    };
+  } else {
+    const parts = parseEnvelope(params.envelopeBlob);
+    if (!parts) {
+      console.warn(
+        "[signingMode] envelope blob is not in enc:v1: or enc:v2: format"
+      );
+      return null;
+    }
+    body = {
+      user_op_hash_hex: params.userOpHashHex,
+      wrapped_dek_b64: parts.wrappedDekB64,
+      iv_hex: parts.ivHex,
+      ciphertext_hex: parts.ciphertextHex,
+      kms_key_arn: params.kmsKeyArn,
+    };
+  }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);

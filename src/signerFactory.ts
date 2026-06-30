@@ -27,7 +27,7 @@ import {
   hashTypedData,
 } from "viem";
 import { privateKeyToAccount, toAccount } from "viem/accounts";
-import { isEnclaveMode, signWithEnclave } from "./signingMode";
+import { isEnclaveMode, signWithEnclave, type AuthProof } from "./signingMode";
 
 export interface SignerOptions {
   /** Hex-encoded EOA private key, with or without 0x prefix.
@@ -42,6 +42,15 @@ export interface SignerOptions {
    *  envelope + KMS ARN in enclave mode, signs via no-key path so the
    *  plaintext never enters this process. */
   ownerAddress?: string;
+  /** v2 (non-custodial) password. Required when the envelope is in
+   *  `enc:v2:` format because the enclave needs it to derive K_user.
+   *  Ignored for v1 / v3 envelopes. */
+  password?: string;
+  /** v3 (device-bound) consent proof. Required when the envelope is
+   *  in `enc:v3:` format — either a Google/Apple id_token bound to
+   *  the user op hash, or a WebAuthn assertion challenged with the
+   *  user op hash. Ignored for v1 / v2 envelopes. */
+  authProof?: AuthProof;
 }
 
 function ensure0xPrefix(s: string): Hex {
@@ -104,18 +113,24 @@ export async function makeSigner(opts: SignerOptions): Promise<Account> {
 
   const envelopeBlob = opts.envelopeBlob;
   const kmsKeyArn = opts.kmsKeyArn;
+  const password = opts.password;
+  const authProof = opts.authProof;
 
-  // The shared enclave-sign closure used by both signMessage AND the
-  // low-level sign primitive (which Safe's signing path eventually hits).
+  // Shared enclave-sign closure used by signMessage / signTypedData /
+  // the low-level sign primitive Safe's signing path eventually hits.
+  // The consent factor (password for v2, authProof for v3) is closed
+  // over so every signature this signer produces carries it.
   const enclaveSign = async (hashHex: Hex): Promise<Hex> => {
     const sig = await signWithEnclave({
       userOpHashHex: hashHex,
       envelopeBlob,
       kmsKeyArn,
+      ...(password !== undefined ? { password } : {}),
+      ...(authProof !== undefined ? { authProof } : {}),
     });
     if (sig === null) {
       throw new Error(
-        "enclave sign returned null — parent-proxy unreachable or KMS attestation rejected"
+        "enclave sign returned null — parent-proxy unreachable, KMS attestation rejected, or v2/v3 consent factor missing/wrong"
       );
     }
     return sig;
