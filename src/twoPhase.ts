@@ -24,16 +24,118 @@
 import { createSmartAccountClient } from "permissionless";
 import { toSafeSmartAccount } from "permissionless/accounts";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
-import { createPublicClient, http, getAddress } from "viem";
+import { createPublicClient, http, getAddress, hashTypedData, concat, concatHex, pad, toHex, type Hex } from "viem";
 import {
   entryPoint07Address,
   type EntryPointVersion,
-  getUserOperationHash,
 } from "viem/account-abstraction";
 import { CHAINS } from "./abstraction";
 import { makeSigner, type SignerOptions } from "./signerFactory";
 import { type AuthProof } from "./signingMode";
 import { stashTicket, consumeTicket, ticketTtlMs } from "./ticketCache";
+
+// ─── Safe 4337 module — EIP-712 SafeOp hash ──────────────────────────
+//
+// Safe smart accounts don't sign the raw ERC-4337 user_op_hash. Their
+// on-chain 4337 module (Safe4337Module) verifies signatures against a
+// SafeOp EIP-712 typed-data hash whose domain is the module contract.
+//
+// This means:
+//   - At submit time, permissionless's signUserOperation calls the owner
+//     with signTypedData({domain: {chainId, verifyingContract: module},
+//     types: SafeOp, message: safeOpFromUserOp}) — see
+//     node_modules/permissionless/_cjs/accounts/safe/signUserOperation.js
+//     line 162-172.
+//   - Our signerFactory.signTypedData hashes that typed data and forwards
+//     the resulting SafeOp EIP-712 hash to the enclave as user_op_hash_hex.
+//   - The enclave verifies clientDataJSON.challenge equals that hash.
+//
+// So the challenge the client signs during PREVIEW must also be the
+// SafeOp EIP-712 hash. If we returned the standalone ERC-4337 hash
+// (getUserOperationHash from viem) instead, the client signs one hash
+// but the enclave receives a different one — verification fails with
+// "challenge binding failed" (surfaced upstream as "consent factor
+// missing/wrong").
+//
+// Values below are lifted verbatim from permissionless's
+// EIP712_SAFE_OPERATION_TYPE_V07 + SAFE_VERSION_TO_ADDRESSES_MAP for
+// Safe 1.4.1 + EntryPoint 0.7. If either default changes upstream we
+// have to bump these together.
+const SAFE_4337_MODULE_ADDRESS_V07 =
+  "0x75cf11467937ce3F2f357CE24ffc3DBF8fD5c226" as const;
+
+const EIP712_SAFE_OPERATION_TYPE_V07 = {
+  SafeOp: [
+    { type: "address", name: "safe" },
+    { type: "uint256", name: "nonce" },
+    { type: "bytes", name: "initCode" },
+    { type: "bytes", name: "callData" },
+    { type: "uint128", name: "verificationGasLimit" },
+    { type: "uint128", name: "callGasLimit" },
+    { type: "uint256", name: "preVerificationGas" },
+    { type: "uint128", name: "maxPriorityFeePerGas" },
+    { type: "uint128", name: "maxFeePerGas" },
+    { type: "bytes", name: "paymasterAndData" },
+    { type: "uint48", name: "validAfter" },
+    { type: "uint48", name: "validUntil" },
+    { type: "address", name: "entryPoint" },
+  ],
+} as const;
+
+/**
+ * Pack the paymaster fields of a v0.7 UserOperation into the single
+ * paymasterAndData bytes field that SafeOp expects. Mirrors permissionless's
+ * getPaymasterAndData helper.
+ */
+function packPaymasterAndData(userOp: any): Hex {
+  if (!userOp.paymaster) return "0x";
+  return concat([
+    userOp.paymaster as Hex,
+    pad(toHex(userOp.paymasterVerificationGasLimit ?? 0n), { size: 16 }),
+    pad(toHex(userOp.paymasterPostOpGasLimit ?? 0n), { size: 16 }),
+    (userOp.paymasterData ?? "0x") as Hex,
+  ]);
+}
+
+/** Pack factory + factoryData into the initCode field. "0x" for existing accounts. */
+function packInitCode(userOp: any): Hex {
+  if (userOp.factory && userOp.factoryData) {
+    return concatHex([userOp.factory as Hex, userOp.factoryData as Hex]);
+  }
+  return "0x";
+}
+
+/**
+ * Compute the SafeOp EIP-712 hash for a prepared UserOperation. This is
+ * the hash Safe's owner will actually sign at submit time — return it
+ * from preview so the client's WebAuthn / OIDC challenge matches.
+ */
+function computeSafeOpHash(preparedUserOp: any, chainId: number): Hex {
+  const safeOpMessage = {
+    safe: preparedUserOp.sender as `0x${string}`,
+    nonce: BigInt(preparedUserOp.nonce ?? 0),
+    initCode: packInitCode(preparedUserOp),
+    callData: (preparedUserOp.callData ?? "0x") as Hex,
+    verificationGasLimit: BigInt(preparedUserOp.verificationGasLimit ?? 0),
+    callGasLimit: BigInt(preparedUserOp.callGasLimit ?? 0),
+    preVerificationGas: BigInt(preparedUserOp.preVerificationGas ?? 0),
+    maxPriorityFeePerGas: BigInt(preparedUserOp.maxPriorityFeePerGas ?? 0),
+    maxFeePerGas: BigInt(preparedUserOp.maxFeePerGas ?? 0),
+    paymasterAndData: packPaymasterAndData(preparedUserOp),
+    validAfter: 0,
+    validUntil: 0,
+    entryPoint: entryPoint07Address as `0x${string}`,
+  };
+  return hashTypedData({
+    domain: {
+      chainId,
+      verifyingContract: SAFE_4337_MODULE_ADDRESS_V07,
+    },
+    types: EIP712_SAFE_OPERATION_TYPE_V07 as any,
+    primaryType: "SafeOp",
+    message: safeOpMessage as any,
+  });
+}
 
 type Call =
   | {
@@ -186,12 +288,15 @@ export async function previewUniversalTransaction(params: {
       calls: transactionCalls,
     });
 
-    const userOpHashHex = getUserOperationHash({
-      userOperation: preparedUserOp,
-      entryPointAddress: entryPoint07Address,
-      entryPointVersion: "0.7",
-      chainId: params.chainId,
-    });
+    // IMPORTANT: return the SafeOp EIP-712 hash, NOT the raw ERC-4337
+    // hash. Safe's signUserOperation at submit time signs the SafeOp
+    // hash via signTypedData, our signer forwards THAT hash to the
+    // enclave, and the enclave checks the WebAuthn / OIDC challenge
+    // against it. If we return getUserOperationHash here, the client
+    // signs one thing and the enclave sees another — every v3 tx
+    // fails with "challenge binding failed" (surfaced as "consent
+    // factor missing/wrong"). See computeSafeOpHash comment at top.
+    const userOpHashHex = computeSafeOpHash(preparedUserOp, params.chainId);
 
     // BigInt-aware JSON: stash the userOp as plain hex-stringified
     // BigInts so we can hash-compare on submit and pass it to viem
