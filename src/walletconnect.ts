@@ -193,7 +193,8 @@ async function handleSessionRequest(
   method: string,
   params: any[],
   config: SessionConfig,
-  authProof?: AuthProof
+  authProof?: AuthProof,
+  wcRequestId?: number
 ): Promise<any> {
   // Envelope-mode (v3) sessions require an authProof on every dApp
   // request — the enclave's challenge binding will reject any signature
@@ -213,6 +214,27 @@ async function handleSessionRequest(
         value: tx.value || "0",
         dataLength: tx.data?.length || 0,
       });
+
+      // v3 fast path: if the client hit /preview first there's a cached
+      // prepared UO for this exact request. Submitting it via the shared
+      // /submit-prepared handler guarantees the user_op_hash matches what
+      // the client signed (no rebuild, no drift). Legacy sessions fall
+      // through to submitUniversalTransaction below.
+      if (envelopeMode && authProof && wcRequestId !== undefined) {
+        const cached = wcTicketByRequestId.get(wcRequestId);
+        if (cached && cached.expiresAt > Date.now()) {
+          wcTicketByRequestId.delete(wcRequestId);
+          const { submitPreparedUniversalTransaction } = await import("./twoPhase");
+          const submit = await submitPreparedUniversalTransaction({
+            ticketId: cached.ticketId,
+            authProof,
+          });
+          if (!submit.success) {
+            throw new Error(submit.error || "Prepared UO submit failed");
+          }
+          return submit.userOperationHash || submit.transactionHash;
+        }
+      }
 
       // Route through smart account
       const calls = [{
@@ -483,6 +505,252 @@ export function getPendingRequests(): PendingRequest[] {
 }
 
 /**
+ * Preview a pending WalletConnect request — computes the hash the
+ * enclave will sign so a v3 (device-bound) session can bind an
+ * authProof to that exact value before approve() actually signs.
+ *
+ * Returns:
+ *   - `hashToSign`: hex — the passkey's clientDataJSON.challenge (or
+ *     OIDC id_token.nonce) MUST equal this before /approve will succeed.
+ *   - `method`: pass-through so the client can decide how to display
+ *     the confirm screen ("Sign message" vs "Send transaction").
+ *   - `peerName`, `smartWalletAddress`, `chainId`: contextual info.
+ *
+ * For eth_sendTransaction the hash is the ERC-4337 user_op_hash from a
+ * fresh prepareUserOperation. That prepared op is stashed in the ticket
+ * cache so /approve doesn't have to rebuild it — same pattern as
+ * /api/transaction/preview.
+ *
+ * For personal_sign / eth_sign / eth_signTypedData_v4 the hash is the
+ * Safe smart-account's SafeMessage typed-data digest (owner-side hash),
+ * computed here so the enclave sees the same value the passkey signed.
+ *
+ * Legacy (local-mode) sessions don't need to call this — they can go
+ * straight to approve() with no authProof. This endpoint is a no-op
+ * for them.
+ */
+export async function previewSessionRequest(requestId: number): Promise<{
+  success: boolean;
+  method?: string;
+  hashToSign?: string;
+  peerName?: string;
+  smartWalletAddress?: string;
+  chainId?: number;
+  ticketId?: string;
+  expiresAtMs?: number;
+  ttlMs?: number;
+  requiresAuthProof: boolean;
+  error?: string;
+}> {
+  const entry = pendingRequests.get(requestId);
+  if (!entry) {
+    return { success: false, requiresAuthProof: false, error: `No pending request with id ${requestId}` };
+  }
+  const { pending, sessionConfig } = entry;
+  const envelopeMode = !!sessionConfig.ownerEncryptedKey;
+
+  try {
+    switch (pending.method) {
+      case "eth_sendTransaction": {
+        const tx = pending.params[0] as { to: string; value?: string; data?: string };
+        const calls = [
+          {
+            to: tx.to,
+            value: tx.value || "0",
+            data: tx.data || undefined,
+          },
+        ];
+        // Only build the userOp when the session is v3 — legacy sessions
+        // can just approve() directly with the plaintext key.
+        if (!envelopeMode) {
+          return {
+            success: true,
+            method: pending.method,
+            peerName: pending.peerName,
+            smartWalletAddress: pending.smartWalletAddress,
+            chainId: pending.chainId,
+            requiresAuthProof: false,
+          };
+        }
+
+        const { previewUniversalTransaction } = await import("./twoPhase");
+        const chainConfig = (await import("./abstraction")).CHAINS[
+          sessionConfig.chainId as keyof (typeof import("./abstraction"))["CHAINS"]
+        ];
+        if (!chainConfig) throw new Error(`Unsupported chain: ${sessionConfig.chainId}`);
+        const result = await previewUniversalTransaction({
+          chainId: sessionConfig.chainId,
+          rpcNodeProvider: sessionConfig.rpcUrl,
+          calls: calls.map((c) => {
+            const call: { to: string; value?: string; data?: string } = { to: c.to };
+            if (c.value !== undefined) call.value = c.value;
+            if (c.data !== undefined) call.data = c.data;
+            return call;
+          }),
+          ownerAddress: sessionConfig.ownerAddress,
+          ownerEncryptedKey: sessionConfig.ownerEncryptedKey!,
+          bundlerUrl: sessionConfig.bundlerUrl,
+          paymasterRPC: sessionConfig.paymasterRPC,
+        });
+        if (!result.success) {
+          return { success: false, requiresAuthProof: true, error: result.error };
+        }
+        // Cross-link the ticket back to the WC request so /approve knows
+        // which cached UO to use even without the client re-sending the
+        // ticket id.
+        wcTicketByRequestId.set(requestId, {
+          ticketId: result.ticketId,
+          expiresAt: result.expiresAt,
+        });
+        return {
+          success: true,
+          method: pending.method,
+          peerName: pending.peerName,
+          smartWalletAddress: pending.smartWalletAddress,
+          chainId: pending.chainId,
+          hashToSign: result.userOpHashHex,
+          ticketId: result.ticketId,
+          expiresAtMs: result.expiresAt,
+          ttlMs: result.ttlMs,
+          requiresAuthProof: true,
+        };
+      }
+
+      case "personal_sign":
+      case "eth_sign": {
+        const messageHex =
+          pending.method === "personal_sign" ? pending.params[0] : pending.params[1];
+        if (!envelopeMode) {
+          return {
+            success: true,
+            method: pending.method,
+            peerName: pending.peerName,
+            smartWalletAddress: pending.smartWalletAddress,
+            chainId: pending.chainId,
+            requiresAuthProof: false,
+          };
+        }
+        // Compute the exact hash the Safe owner will sign. viem's
+        // hashMessage does the EIP-191 wrap; Safe then wraps THAT in an
+        // EIP-712 SafeMessage before the owner signs — we do the same
+        // here so the returned hash is what the enclave will see.
+        const rawMessage = ethers.utils.arrayify(messageHex);
+        const eip191Hash = (await import("viem")).hashMessage({
+          raw: rawMessage as any,
+        });
+        const hashToSign = computeSafeMessageHash(
+          eip191Hash,
+          sessionConfig.smartWalletAddress,
+          sessionConfig.chainId
+        );
+        return {
+          success: true,
+          method: pending.method,
+          peerName: pending.peerName,
+          smartWalletAddress: pending.smartWalletAddress,
+          chainId: pending.chainId,
+          hashToSign,
+          requiresAuthProof: true,
+        };
+      }
+
+      case "eth_signTypedData":
+      case "eth_signTypedData_v3":
+      case "eth_signTypedData_v4": {
+        const typedData =
+          typeof pending.params[1] === "string"
+            ? JSON.parse(pending.params[1])
+            : pending.params[1];
+        if (!envelopeMode) {
+          return {
+            success: true,
+            method: pending.method,
+            peerName: pending.peerName,
+            smartWalletAddress: pending.smartWalletAddress,
+            chainId: pending.chainId,
+            requiresAuthProof: false,
+          };
+        }
+        const filteredTypes = { ...typedData.types };
+        delete filteredTypes.EIP712Domain;
+        const inner = (await import("viem")).hashTypedData({
+          domain: typedData.domain,
+          types: filteredTypes,
+          primaryType: typedData.primaryType,
+          message: typedData.message,
+        });
+        const hashToSign = computeSafeMessageHash(
+          inner,
+          sessionConfig.smartWalletAddress,
+          sessionConfig.chainId
+        );
+        return {
+          success: true,
+          method: pending.method,
+          peerName: pending.peerName,
+          smartWalletAddress: pending.smartWalletAddress,
+          chainId: pending.chainId,
+          hashToSign,
+          requiresAuthProof: true,
+        };
+      }
+
+      default:
+        // Chain / accounts / switch chain don't sign anything — just
+        // return so the client can approve() without an authProof.
+        return {
+          success: true,
+          method: pending.method,
+          peerName: pending.peerName,
+          smartWalletAddress: pending.smartWalletAddress,
+          chainId: pending.chainId,
+          requiresAuthProof: false,
+        };
+    }
+  } catch (e: any) {
+    console.error(`❌ Preview WC request ${requestId} failed:`, e);
+    return { success: false, requiresAuthProof: envelopeMode, error: e?.message || String(e) };
+  }
+}
+
+// Ticket id (from twoPhase preview) for pending WC eth_sendTransaction
+// requests. Populated by previewSessionRequest(), consumed by
+// approveRequest() to skip rebuilding the userOp. Cleared on approve /
+// reject / preview-expiry.
+const wcTicketByRequestId = new Map<number, { ticketId: string; expiresAt: number }>();
+
+/**
+ * Compute the Safe smart-account's SafeMessage EIP-712 digest — this is
+ * the hash the owner (our enclave signer) actually signs. Wraps whatever
+ * inner hash the caller provides (EIP-191 for personal_sign, EIP-712 for
+ * signTypedData).
+ *
+ * Safe 1.4.1 SafeMessage type:
+ *   SafeMessage(bytes message)
+ *   domain: {chainId, verifyingContract: safeAddress}  (no name/version in 1.4.1)
+ */
+function computeSafeMessageHash(
+  innerHash: string,
+  safeAddress: string,
+  chainId: number
+): string {
+  const { hashTypedData } = require("viem");
+  return hashTypedData({
+    domain: {
+      chainId,
+      verifyingContract: safeAddress as `0x${string}`,
+    },
+    types: {
+      SafeMessage: [{ name: "message", type: "bytes" }],
+    },
+    primaryType: "SafeMessage",
+    message: {
+      message: innerHash as `0x${string}`,
+    },
+  });
+}
+
+/**
  * Approve a pending request — executes it and responds to the DApp.
  *
  * For v3 (envelope-mode) sessions, `authProof` is REQUIRED. Each
@@ -518,7 +786,8 @@ export async function approveRequest(
       pending.method,
       pending.params,
       sessionConfig,
-      authProof
+      authProof,
+      requestId
     );
     await wallet.respondSessionRequest({
       topic: pending.topic,
@@ -570,6 +839,7 @@ export async function rejectRequest(requestId: number): Promise<void> {
   });
 
   pendingRequests.delete(requestId);
+  wcTicketByRequestId.delete(requestId);
   emitEvent({ type: "request_rejected", topic: pending.topic, data: { method: pending.method } });
   console.log(`❌ Request ${requestId} rejected by user: ${pending.method}`);
 }

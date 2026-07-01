@@ -2011,6 +2011,67 @@ router.get('/api/walletconnect/requests', checkRateLimit, async (_req, res) => {
 });
 
 // Approve a pending WalletConnect request
+// v3 non-custodial preview: computes the hash the enclave will sign for
+// a pending WC request so the client can bind an authProof (WebAuthn
+// challenge / OIDC nonce) to that exact value before /approve runs the
+// signing. For eth_sendTransaction it also stashes the prepared UO in
+// the ticket cache — /approve then submits the cached op instead of
+// rebuilding one, guaranteeing the hash the client signed matches.
+//
+// Legacy (local-mode) sessions return { requiresAuthProof: false } and
+// can skip straight to /approve — this endpoint is a cheap no-op for them.
+router.post('/api/walletconnect/requests/:id/preview', checkRateLimit, async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id, 10);
+    if (isNaN(requestId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid request ID',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const { previewSessionRequest } = await import('./walletconnect');
+    const result = await previewSessionRequest(requestId);
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        method: result.method,
+        peerName: result.peerName,
+        smart_account_address: result.smartWalletAddress,
+        chain_id: result.chainId,
+        hash_to_sign: result.hashToSign,
+        ticket_id: result.ticketId,
+        expires_at_ms: result.expiresAtMs,
+        ttl_ms: result.ttlMs,
+        requires_auth_proof: result.requiresAuthProof,
+      },
+      message: result.requiresAuthProof
+        ? 'Sign hash_to_sign with your passkey / OIDC and POST /approve with authProof.'
+        : 'Legacy session — approve() directly, no authProof needed.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/walletconnect/requests/:id/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'preview failed',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 router.post('/api/walletconnect/requests/:id/approve', checkRateLimit, async (req, res) => {
   try {
     const requestId = parseInt(req.params.id, 10);
