@@ -726,12 +726,32 @@ router.post('/api/transaction/preview', checkRateLimit, async (req, res) => {
       ownerEncryptedKey,
       ownerAddress,
       rpcUrl,
+      // Optional markup fields. When these are present AND a valid
+      // transferTokenAddress + transferBaseAmountWei pair is supplied,
+      // the preview endpoint appends the Rift + project markup transfer
+      // calls to the calls array before running preview. Backend v3
+      // controllers set these; the v1 flows never hit this endpoint.
+      markupBps,
+      projectMarkupBps,
+      projectTreasuryAddress,
+      transferTokenAddress,
+      transferBaseAmountWei,
+      // Optional flat markup: used for non-transfer flows (bridge,
+      // arbitrary calls) where the percentage markup has no clear base.
+      // The paymaster token is charged a flat fee per UserOp.
+      flatMarkupTokenAddress,
     } = req.body as {
       chainId: number;
       calls: Array<{ to: string; value?: string; data?: string }>;
       ownerEncryptedKey: string;
       ownerAddress: string;
       rpcUrl: string;
+      markupBps?: number;
+      projectMarkupBps?: number;
+      projectTreasuryAddress?: string;
+      transferTokenAddress?: string;
+      transferBaseAmountWei?: string;
+      flatMarkupTokenAddress?: string;
     };
 
     if (
@@ -773,11 +793,97 @@ router.post('/api/transaction/preview', checkRateLimit, async (req, res) => {
       return;
     }
 
+    // ─── Inject markup calls (v3 monetization) ─────────────────────
+    // Percentage markup applies when the caller supplied a real
+    // transfer base. Flat markup applies when the caller only supplied
+    // a paymaster token (bridge, arbitrary txns). Either can be
+    // present, both, or neither; each markup helper safely returns
+    // null when its inputs are missing.
+    const augmentedCalls: Array<{ to: string; value?: string; data?: string }> = [...calls];
+    try {
+      const { getMarkupConfig, buildMarkupTransferCall, buildProjectMarkupTransferCall, getFlatMarkupConfig, buildFlatMarkupTransferCall } = await import('./markup');
+      const { encodeFunctionData } = await import('viem');
+
+      // Percentage markup on the transfer base.
+      if (transferTokenAddress && transferBaseAmountWei && ethers.utils.isAddress(transferTokenAddress)) {
+        let baseWei: bigint;
+        try {
+          baseWei = BigInt(transferBaseAmountWei);
+        } catch {
+          baseWei = 0n;
+        }
+        if (baseWei > 0n) {
+          const riftConfig = getMarkupConfig(markupBps);
+          const riftCall = buildMarkupTransferCall({
+            tokenAddress: transferTokenAddress as any,
+            transferAmountWei: baseWei,
+            config: riftConfig,
+          });
+          if (riftCall) {
+            augmentedCalls.push({
+              to: riftCall.to,
+              value: '0',
+              data: encodeFunctionData({
+                abi: riftCall.abi,
+                functionName: riftCall.functionName,
+                args: riftCall.args,
+              }),
+            });
+            console.log(`[markup-preview] Rift ${riftConfig.bps} bps → ${riftConfig.treasury} amount=${riftCall.args[1]}`);
+          }
+          const projectCall = buildProjectMarkupTransferCall({
+            tokenAddress: transferTokenAddress as any,
+            transferAmountWei: baseWei,
+            projectBps: projectMarkupBps,
+            projectTreasury: projectTreasuryAddress,
+          });
+          if (projectCall) {
+            augmentedCalls.push({
+              to: projectCall.to,
+              value: '0',
+              data: encodeFunctionData({
+                abi: projectCall.abi,
+                functionName: projectCall.functionName,
+                args: projectCall.args,
+              }),
+            });
+            console.log(`[markup-preview] Project ${projectMarkupBps} bps → ${projectCall.args[0]} amount=${projectCall.args[1]}`);
+          }
+        }
+      }
+
+      // Flat markup for non-transfer flows (bridge / arbitrary).
+      if (flatMarkupTokenAddress && ethers.utils.isAddress(flatMarkupTokenAddress)) {
+        const flatConfig = getFlatMarkupConfig();
+        const flatCall = buildFlatMarkupTransferCall({
+          tokenAddress: flatMarkupTokenAddress as any,
+          config: flatConfig,
+        });
+        if (flatCall) {
+          augmentedCalls.push({
+            to: flatCall.to,
+            value: '0',
+            data: encodeFunctionData({
+              abi: flatCall.abi,
+              functionName: flatCall.functionName,
+              args: flatCall.args,
+            }),
+          });
+          console.log(`[markup-preview] Flat markup ${flatConfig.amountWei} → ${flatConfig.treasury}`);
+        }
+      }
+    } catch (markupErr: any) {
+      // Never let a markup failure block a preview. Log + continue with
+      // the unmodified calls array. Missing markup is a revenue leak we
+      // can catch later; a failed preview is a broken UX.
+      console.warn('[markup-preview] failed to inject markup calls, continuing without:', markupErr?.message || markupErr);
+    }
+
     const { previewUniversalTransaction } = await import('./twoPhase');
     const result = await previewUniversalTransaction({
       chainId,
       rpcNodeProvider: rpcUrl,
-      calls,
+      calls: augmentedCalls,
       ownerAddress,
       ownerEncryptedKey,
       bundlerUrl: chainConfig.bundlerUrl,
@@ -946,6 +1052,38 @@ router.post('/api/bridge/preview', checkRateLimit, async (req, res) => {
       destChainId
     );
 
+    // Bridge uses the flat markup (not percentage — bridge has no
+    // clean "transfer amount" base to charge against). We append a
+    // transfer(treasury, flat_fee) call to the bridge calls array so
+    // the same UserOp that runs the bridge also pays the fee.
+    const augmentedBridgeCalls: any[] = bridgeCalls.map((c: any) => ({
+      to: c.to as string,
+      value: c.value !== undefined ? String(c.value) : '0',
+      abi: c.abi,
+      functionName: c.functionName,
+      args: c.args,
+    }));
+    try {
+      const { getFlatMarkupConfig, buildFlatMarkupTransferCall } = await import('./markup');
+      const flatConfig = getFlatMarkupConfig();
+      const flatCall = buildFlatMarkupTransferCall({
+        tokenAddress: tokenAddress as any,
+        config: flatConfig,
+      });
+      if (flatCall) {
+        augmentedBridgeCalls.push({
+          to: flatCall.to,
+          value: '0',
+          abi: flatCall.abi,
+          functionName: flatCall.functionName,
+          args: flatCall.args,
+        });
+        console.log(`[markup-preview] Bridge flat markup ${flatConfig.amountWei} → ${flatConfig.treasury}`);
+      }
+    } catch (markupErr: any) {
+      console.warn('[markup-preview] bridge flat markup failed, continuing without:', markupErr?.message || markupErr);
+    }
+
     // Hand to the generic preview — it will run prepareUserOperation
     // over these ABI-style calls and stash the prepared UO + chain
     // context in the ticket cache.
@@ -953,13 +1091,7 @@ router.post('/api/bridge/preview', checkRateLimit, async (req, res) => {
     const previewResult = await previewUniversalTransaction({
       chainId: sourceChainId,
       rpcNodeProvider: rpcUrl,
-      calls: bridgeCalls.map((c: any) => ({
-        to: c.to as string,
-        value: c.value !== undefined ? String(c.value) : '0',
-        abi: c.abi,
-        functionName: c.functionName,
-        args: c.args,
-      })) as any,
+      calls: augmentedBridgeCalls as any,
       ownerAddress,
       ownerEncryptedKey,
       bundlerUrl: chainConfig.bundlerUrl,
