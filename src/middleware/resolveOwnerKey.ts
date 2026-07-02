@@ -50,6 +50,17 @@ export async function resolveOwnerKey(
       return next();
     }
 
+    // Defense in depth: v2 / v3 envelopes CANNOT be decrypted here
+    // regardless of SIGNING_MODE. v2 needs the user's password, v3
+    // needs an enclave-side authProof — neither is available to this
+    // middleware. Route handlers that support envelope-mode signing
+    // will pick up the blob and route through makeSigner / signRemote.
+    // If we accidentally called decryptKey on a v2/v3 blob it would
+    // fall through to legacyDecrypt and throw "Legacy AES blob…", which
+    // is the exact confusing error we saw pairing WalletConnect from a
+    // v3 wallet when the smart-wallet's SIGNING_MODE env wasn't set.
+    const isV2OrV3 = encrypted.startsWith("enc:v2:") || encrypted.startsWith("enc:v3:");
+
     // Phase 1 no-key path: in enclave mode we DO NOT decrypt here.
     // The route handler builds a viem signer that only knows the
     // owner address; signing happens inside the Nitro enclave. The
@@ -57,7 +68,10 @@ export async function resolveOwnerKey(
     //
     // The blob stays on the body so the route can forward it to the
     // enclave via the parent-proxy.
-    if ((process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave") {
+    if (
+      isV2OrV3 ||
+      (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave"
+    ) {
       // Sanity: backend must also pass `ownerAddress`. Backend's
       // signatureController/bridgeController/erc20_transfer all do —
       // if they don't, the route returns 400 cleanly.
@@ -65,6 +79,7 @@ export async function resolveOwnerKey(
     }
 
     // Local mode: decrypt and stamp plaintext for the legacy signing path.
+    // Only reachable for enc:v1: envelopes or the raw <iv>:<ct> legacy blob.
     const plaintext = await decryptKey(encrypted);
     body.ownerPrivateKey = plaintext;
     // Keep the envelope blob on the body too so the route handler can
