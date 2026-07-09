@@ -171,6 +171,16 @@ export async function signWithEnclave(params: {
   password?: string;
   /** Required for v3 envelopes (device-bound). Ignored for v1 / v2. */
   authProof?: AuthProof;
+  /**
+   * Optional per-request override. When provided, the sign call goes
+   * to the integrator's own parent-proxy with their bearer instead of
+   * the process-wide env defaults (PARENT_PROXY_URL / PARENT_PROXY_AUTH_TOKEN).
+   * Set by the route layer after resolving the caller's projectId
+   * against the backend's /internal/projects/:id/enclave-config
+   * endpoint. When null / omitted, env defaults apply (current single-
+   * tenant Rift-hosted flow).
+   */
+  route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
 }): Promise<Hex | null> {
   if (!isEnclaveMode()) return null;
 
@@ -242,19 +252,22 @@ export async function signWithEnclave(params: {
   const timer = setTimeout(() => controller.abort(), 30_000);
 
   try {
-    // Build headers. When PARENT_PROXY_AUTH_TOKEN is set in env, send
-    // the matching Bearer token — the parent-proxy on the EC2 will
-    // 401 anything else, so this is the gate that keeps random
-    // internet from hitting the public /sign endpoint.
+    // Route resolution. When a per-request route is provided (multi-
+    // tenant integrator flow), send to THAT parent-proxy with THEIR
+    // bearer. Otherwise use the process-wide env defaults — the
+    // Rift-hosted single-tenant flow.
+    const targetUrl = params.route?.parentProxyUrl ?? PARENT_PROXY_URL;
+    const targetBearer =
+      params.route?.parentProxyBearer ?? process.env.PARENT_PROXY_AUTH_TOKEN;
+
     const headers: Record<string, string> = {
       "content-type": "application/json",
     };
-    const proxyToken = process.env.PARENT_PROXY_AUTH_TOKEN;
-    if (proxyToken) {
-      headers["authorization"] = `Bearer ${proxyToken}`;
+    if (targetBearer) {
+      headers["authorization"] = `Bearer ${targetBearer}`;
     }
 
-    const response = await fetch(`${PARENT_PROXY_URL}/sign`, {
+    const response = await fetch(`${targetUrl}/sign`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
