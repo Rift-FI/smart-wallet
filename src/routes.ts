@@ -111,6 +111,13 @@ interface UniversalTransferBody {
   projectMarkupBps?: number;
   /** Project's treasury address (required when projectMarkupBps > 0). */
   projectTreasuryAddress?: string;
+  /**
+   * Optional project id for multi-tenant enclave routing. When set
+   * and the backend has a ProjectEnclaveConfig row for this project,
+   * signing goes to the integrator's own parent-proxy + KMS instead
+   * of Rift's centralized defaults. Null / omitted → env defaults.
+   */
+  projectId?: string;
 }
 
 router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
@@ -130,8 +137,24 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       rpcUrl,
       markupBps,
       projectMarkupBps,
-      projectTreasuryAddress
+      projectTreasuryAddress,
+      projectId,
     } = req.body as UniversalTransferBody;
+
+    // Multi-tenant enclave routing: resolve THIS project's config
+    // (parent-proxy URL/bearer + KMS ARN + per-chain bundler+rpc+
+    // paymaster). Returns null when the project has no override,
+    // in which case every subsequent line falls back to env defaults
+    // exactly like the single-tenant Rift-hosted flow.
+    const { resolveChainConfig, resolveEnclaveConfig } = await import(
+      "./enclaveConfigClient"
+    );
+    const enclaveConfig = projectId
+      ? await resolveEnclaveConfig(projectId)
+      : null;
+    const chainOverride = projectId
+      ? await resolveChainConfig(projectId, chainId)
+      : null;
 
     // Key material requirements depend on signing mode:
     //   local mode  → `ownerPrivateKey` must be present
@@ -217,14 +240,18 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    const bundlerUrl = chainConfig.bundlerUrl;
-    const paymasterRPC = chainConfig.paymasterRPC;
+    // Prefer per-project chain routing when the project has an
+    // override row; fall back to env-based Rift-hosted defaults
+    // otherwise. Same shape either way.
+    const bundlerUrl = chainOverride?.bundlerUrl ?? chainConfig.bundlerUrl;
+    const paymasterRPC =
+      chainOverride?.paymasterUrl ?? chainConfig.paymasterRPC;
 
     if (!bundlerUrl || !paymasterRPC) {
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC (or per-project chain config for project ${projectId ?? "n/a"}).`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -254,10 +281,27 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       ownerAddress?: string;
       password?: string;
       authProof?: import("./signingMode").AuthProof;
+      route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
     } = {};
     const transferBlob = (req.body as any).ownerEncryptedKey;
     if (typeof transferBlob === "string") transferSignerOpts.envelopeBlob = transferBlob;
-    if (process.env.KMS_KEY_ARN) transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    // KMS ARN precedence: per-project config > env. So an integrator
+    // hosting their own KMS in their own AWS account decrypts their
+    // users' DEKs against THEIR key, not Rift's.
+    if (enclaveConfig?.kmsKeyArn) {
+      transferSignerOpts.kmsKeyArn = enclaveConfig.kmsKeyArn;
+    } else if (process.env.KMS_KEY_ARN) {
+      transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    }
+    // Parent-proxy route override: when the project has their own
+    // Nitro Enclave stack, every sign call goes there with their
+    // bearer instead of Rift's centralized proxy.
+    if (enclaveConfig) {
+      transferSignerOpts.route = {
+        parentProxyUrl: enclaveConfig.parentProxyUrl,
+        parentProxyBearer: enclaveConfig.parentProxyBearer,
+      };
+    }
     transferSignerOpts.ownerAddress = ownerAddress;
     // v2 password (non-custodial). Required if the envelope is v2.
     const transferPassword = (req.body as any).password;

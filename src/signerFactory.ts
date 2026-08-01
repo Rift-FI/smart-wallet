@@ -51,6 +51,12 @@ export interface SignerOptions {
    *  the user op hash, or a WebAuthn assertion challenged with the
    *  user op hash. Ignored for v1 / v2 envelopes. */
   authProof?: AuthProof;
+  /** Per-request parent-proxy override. When set, every sign call this
+   *  signer produces routes to the integrator's own parent-proxy with
+   *  their bearer instead of the process-wide env defaults. Set by the
+   *  route layer after `resolveEnclaveConfig(projectId)` returned a
+   *  config row. Null / undefined → env defaults (Rift-hosted flow). */
+  route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
 }
 
 function ensure0xPrefix(s: string): Hex {
@@ -115,11 +121,13 @@ export async function makeSigner(opts: SignerOptions): Promise<Account> {
   const kmsKeyArn = opts.kmsKeyArn;
   const password = opts.password;
   const authProof = opts.authProof;
+  const route = opts.route ?? null;
 
   // Shared enclave-sign closure used by signMessage / signTypedData /
   // the low-level sign primitive Safe's signing path eventually hits.
-  // The consent factor (password for v2, authProof for v3) is closed
-  // over so every signature this signer produces carries it.
+  // The consent factor (password for v2, authProof for v3) and the
+  // per-request route override are closed over so every signature
+  // this signer produces carries them consistently.
   const enclaveSign = async (hashHex: Hex): Promise<Hex> => {
     const sig = await signWithEnclave({
       userOpHashHex: hashHex,
@@ -127,6 +135,7 @@ export async function makeSigner(opts: SignerOptions): Promise<Account> {
       kmsKeyArn,
       ...(password !== undefined ? { password } : {}),
       ...(authProof !== undefined ? { authProof } : {}),
+      ...(route ? { route } : {}),
     });
     if (sig === null) {
       throw new Error(
