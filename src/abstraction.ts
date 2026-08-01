@@ -14,7 +14,7 @@ import {
 
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
-import { privateKeyToAccount } from "viem/accounts";
+import { makeSigner, type SignerOptions } from "./signerFactory";
 import { base, polygon, celo, mainnet, arbitrum, avalanche, bsc, berachain } from "viem/chains";
 import {
   isCeloChain,
@@ -71,7 +71,9 @@ export const submitTransaction = async (
   /** Project's own markup bps — paid to the project's own treasury. */
   projectMarkupBps?: number,
   /** Project's own treasury address (required when projectMarkupBps > 0). */
-  projectTreasuryAddress?: string
+  projectTreasuryAddress?: string,
+  /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -114,8 +116,17 @@ export const submitTransaction = async (
       },
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    // Build signer options. In enclave mode + ownerAddress provided,
+    // makeSigner takes the no-key path and `ownerPrivateKey` is
+    // ignored (it's typically "" or unset in that case).
+    const signerOpts: SignerOptions = {};
+    if (ownerPrivateKey) signerOpts.privateKey = ownerPrivateKey;
+    if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
+    if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
+    if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
+    if (signerOptions?.password) signerOpts.password = signerOptions.password;
+    if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
+    const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 
     // Create Safe smart account
@@ -407,7 +418,9 @@ export const submitUniversalTransaction = async (
   ownerPrivateKey: string,
   bundlerUrl: string,
   paymasterRPC: string,
-  paymasterToken?: string
+  paymasterToken?: string,
+  /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
+  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">,
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -454,8 +467,17 @@ export const submitUniversalTransaction = async (
       },
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    // Build signer options. In enclave mode + ownerAddress provided,
+    // makeSigner takes the no-key path and `ownerPrivateKey` is
+    // ignored (it's typically "" or unset in that case).
+    const signerOpts: SignerOptions = {};
+    if (ownerPrivateKey) signerOpts.privateKey = ownerPrivateKey;
+    if (signerOptions?.envelopeBlob) signerOpts.envelopeBlob = signerOptions.envelopeBlob;
+    if (signerOptions?.kmsKeyArn) signerOpts.kmsKeyArn = signerOptions.kmsKeyArn;
+    if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
+    if (signerOptions?.password) signerOpts.password = signerOptions.password;
+    if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
+    const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 
     // Create Safe smart account

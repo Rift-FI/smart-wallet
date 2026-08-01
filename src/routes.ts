@@ -111,6 +111,13 @@ interface UniversalTransferBody {
   projectMarkupBps?: number;
   /** Project's treasury address (required when projectMarkupBps > 0). */
   projectTreasuryAddress?: string;
+  /**
+   * Optional project id for multi-tenant enclave routing. When set
+   * and the backend has a ProjectEnclaveConfig row for this project,
+   * signing goes to the integrator's own parent-proxy + KMS instead
+   * of Rift's centralized defaults. Null / omitted → env defaults.
+   */
+  projectId?: string;
 }
 
 router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
@@ -130,15 +137,42 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       rpcUrl,
       markupBps,
       projectMarkupBps,
-      projectTreasuryAddress
+      projectTreasuryAddress,
+      projectId,
     } = req.body as UniversalTransferBody;
 
-    // Validate required fields
-    if (!chainId || !tokenAddress || !recipient || !amount || !ownerPrivateKey || !ownerAddress || !rpcUrl) {
+    // Multi-tenant enclave routing: resolve THIS project's config
+    // (parent-proxy URL/bearer + KMS ARN + per-chain bundler+rpc+
+    // paymaster). Returns null when the project has no override,
+    // in which case every subsequent line falls back to env defaults
+    // exactly like the single-tenant Rift-hosted flow.
+    const { resolveChainConfig, resolveEnclaveConfig } = await import(
+      "./enclaveConfigClient"
+    );
+    const enclaveConfig = projectId
+      ? await resolveEnclaveConfig(projectId)
+      : null;
+    const chainOverride = projectId
+      ? await resolveChainConfig(projectId, chainId)
+      : null;
+
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
+    if (!chainId || !tokenAddress || !recipient || !amount || !keyMaterialOk || !ownerAddress || !rpcUrl) {
       res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: chainId, tokenAddress, recipient, amount, ownerPrivateKey, ownerAddress, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: chainId, tokenAddress, recipient, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: chainId, tokenAddress, recipient, amount, ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -166,26 +200,32 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+    // Verify owner address matches private key — local mode only. In
+    // enclave mode the plaintext key never enters this process so
+    // there's nothing to verify against; `ownerAddress` is taken on
+    // trust (parent-proxy /sign produces a signature recoverable to
+    // that address, or fails).
+    if (!inEnclaveMode) {
+      try {
+        const wallet = new ethers.Wallet(ownerPrivateKey);
+        if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+          res.status(400).json({
+            success: false,
+            error: 'Authentication Error',
+            message: 'Private key does not match owner address',
+            timestamp: new Date().toISOString(),
+          } as any);
+          return;
+        }
+      } catch (error) {
         res.status(400).json({
           success: false,
-          error: 'Authentication Error',
-          message: 'Private key does not match owner address',
+          error: 'Validation Error',
+          message: 'Invalid private key format',
           timestamp: new Date().toISOString(),
         } as any);
         return;
       }
-    } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      } as any);
-      return;
     }
 
     // Get bundler and paymaster URLs based on chainId
@@ -200,14 +240,18 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    const bundlerUrl = chainConfig.bundlerUrl;
-    const paymasterRPC = chainConfig.paymasterRPC;
+    // Prefer per-project chain routing when the project has an
+    // override row; fall back to env-based Rift-hosted defaults
+    // otherwise. Same shape either way.
+    const bundlerUrl = chainOverride?.bundlerUrl ?? chainConfig.bundlerUrl;
+    const paymasterRPC =
+      chainOverride?.paymasterUrl ?? chainConfig.paymasterRPC;
 
     if (!bundlerUrl || !paymasterRPC) {
       res.status(500).json({
         success: false,
         error: 'Configuration Error',
-        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC`,
+        message: `Missing environment variables for chain ${chainId}. Check ${chainConfig.envPrefix}_BUNDLER_URL/${chainConfig.envPrefix}_PAYMASTER_RPC (or per-project chain config for project ${projectId ?? "n/a"}).`,
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -227,7 +271,48 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
     console.log(`💰 Balance validation will be performed during smart account transaction`);
     console.log(`⚡ Gas will be sponsored by ERC-20 paymaster using user's tokens`);
 
-    // Execute transfer with circuit breaker
+    // Execute transfer with circuit breaker.
+    // Phase 1: pass through the envelope blob + KMS ARN + ownerAddress
+    // so makeSigner can route to the enclave's no-key path (plaintext
+    // never enters this Node process when SIGNING_MODE=enclave).
+    const transferSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
+      route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
+    } = {};
+    const transferBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof transferBlob === "string") transferSignerOpts.envelopeBlob = transferBlob;
+    // KMS ARN precedence: per-project config > env. So an integrator
+    // hosting their own KMS in their own AWS account decrypts their
+    // users' DEKs against THEIR key, not Rift's.
+    if (enclaveConfig?.kmsKeyArn) {
+      transferSignerOpts.kmsKeyArn = enclaveConfig.kmsKeyArn;
+    } else if (process.env.KMS_KEY_ARN) {
+      transferSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    }
+    // Parent-proxy route override: when the project has their own
+    // Nitro Enclave stack, every sign call goes there with their
+    // bearer instead of Rift's centralized proxy.
+    if (enclaveConfig) {
+      transferSignerOpts.route = {
+        parentProxyUrl: enclaveConfig.parentProxyUrl,
+        parentProxyBearer: enclaveConfig.parentProxyBearer,
+      };
+    }
+    transferSignerOpts.ownerAddress = ownerAddress;
+    // v2 password (non-custodial). Required if the envelope is v2.
+    const transferPassword = (req.body as any).password;
+    if (typeof transferPassword === "string" && transferPassword.length > 0) {
+      transferSignerOpts.password = transferPassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const transferAuthProof = (req.body as any).authProof;
+    if (transferAuthProof && typeof transferAuthProof === "object") {
+      transferSignerOpts.authProof = transferAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitTransaction(
         chainId,
@@ -240,7 +325,8 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
         paymasterRPC,
         markupBps,
         projectMarkupBps,
-        projectTreasuryAddress
+        projectTreasuryAddress,
+        transferSignerOpts
       )
     );
 
@@ -438,12 +524,24 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       paymasterToken
     } = req.body as UniversalTransactionBody;
 
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
     // Validate required fields
-    if (!chainId || !calls || !Array.isArray(calls) || calls.length === 0 || !ownerPrivateKey || !ownerAddress || !rpcUrl) {
+    if (!chainId || !calls || !Array.isArray(calls) || calls.length === 0 || !keyMaterialOk || !ownerAddress || !rpcUrl) {
       res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: chainId, calls (non-empty array), ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
       return;
@@ -516,26 +614,32 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+    // Verify owner address matches private key — local mode only. In
+    // enclave mode the plaintext key never enters this process so
+    // there's nothing to verify against; `ownerAddress` is taken on
+    // trust (parent-proxy /sign produces a signature recoverable to
+    // that address, or fails).
+    if (!inEnclaveMode) {
+      try {
+        const wallet = new ethers.Wallet(ownerPrivateKey);
+        if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
+          res.status(400).json({
+            success: false,
+            error: 'Authentication Error',
+            message: 'Private key does not match owner address',
+            timestamp: new Date().toISOString(),
+          } as any);
+          return;
+        }
+      } catch (error) {
         res.status(400).json({
           success: false,
-          error: 'Authentication Error',
-          message: 'Private key does not match owner address',
+          error: 'Validation Error',
+          message: 'Invalid private key format',
           timestamp: new Date().toISOString(),
         } as any);
         return;
       }
-    } catch (error) {
-      res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      } as any);
-      return;
     }
 
     // Get bundler and paymaster URLs based on chainId
@@ -574,7 +678,29 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
 
     console.log(`⚡ Gas will be ${paymasterToken ? `paid with ${paymasterToken} tokens via ERC-20 paymaster` : 'sponsored by paymaster'}`);
 
-    // Execute universal transaction with circuit breaker
+    // Execute universal transaction with circuit breaker.
+    // Phase 1: pass envelope + KMS ARN + ownerAddress for enclave no-key routing.
+    const universalSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
+    } = {};
+    const universalBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof universalBlob === "string") universalSignerOpts.envelopeBlob = universalBlob;
+    if (process.env.KMS_KEY_ARN) universalSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    if (ownerAddress) universalSignerOpts.ownerAddress = ownerAddress;
+    // v2 password (non-custodial). Required if the envelope is v2.
+    const universalPassword = (req.body as any).password;
+    if (typeof universalPassword === "string" && universalPassword.length > 0) {
+      universalSignerOpts.password = universalPassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const universalAuthProof = (req.body as any).authProof;
+    if (universalAuthProof && typeof universalAuthProof === "object") {
+      universalSignerOpts.authProof = universalAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         chainId,
@@ -583,7 +709,8 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
         ownerPrivateKey,
         bundlerUrl,
         paymasterRPC,
-        paymasterToken
+        paymasterToken,
+        universalSignerOpts
       )
     );
 
@@ -618,6 +745,506 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
   }
 });
 
+
+// ==================== TWO-PHASE v3 (DEVICE-BOUND) ENDPOINTS ====================
+//
+// v3 envelopes need an authProof whose challenge equals the user_op_hash
+// being signed. Hash isn't known until the user op is built, so the flow
+// is two-step:
+//
+//   1. POST /api/transaction/preview            → user_op_hash + ticket_id
+//   2. (client signs hash with passkey / OIDC)
+//   3. POST /api/transaction/submit-prepared    → submits with authProof
+//
+// Ticket is single-use, 60s TTL. Stateless callers welcome — the ticket
+// is opaque on the wire and only meaningful within this process.
+//
+// v1 / v2 envelopes keep using POST /api/transaction (one-phase) since
+// they don't need a challenge bound to the user op hash.
+
+router.post('/api/transaction/preview', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      chainId,
+      calls,
+      ownerEncryptedKey,
+      ownerAddress,
+      rpcUrl,
+      // Optional markup fields. When these are present AND a valid
+      // transferTokenAddress + transferBaseAmountWei pair is supplied,
+      // the preview endpoint appends the Rift + project markup transfer
+      // calls to the calls array before running preview. Backend v3
+      // controllers set these; the v1 flows never hit this endpoint.
+      markupBps,
+      projectMarkupBps,
+      projectTreasuryAddress,
+      transferTokenAddress,
+      transferBaseAmountWei,
+      // Optional flat markup: used for non-transfer flows (bridge,
+      // arbitrary calls) where the percentage markup has no clear base.
+      // The paymaster token is charged a flat fee per UserOp.
+      flatMarkupTokenAddress,
+    } = req.body as {
+      chainId: number;
+      calls: Array<{ to: string; value?: string; data?: string }>;
+      ownerEncryptedKey: string;
+      ownerAddress: string;
+      rpcUrl: string;
+      markupBps?: number;
+      projectMarkupBps?: number;
+      projectTreasuryAddress?: string;
+      transferTokenAddress?: string;
+      transferBaseAmountWei?: string;
+      flatMarkupTokenAddress?: string;
+    };
+
+    if (
+      !chainId ||
+      !Array.isArray(calls) ||
+      calls.length === 0 ||
+      !ownerEncryptedKey ||
+      !ownerAddress ||
+      !rpcUrl
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message:
+          'All fields required: chainId, calls (non-empty), ownerEncryptedKey, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    if (!ethers.utils.isAddress(ownerAddress)) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid owner address',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const chainConfig = getChainConfig(chainId);
+    if (!chainConfig) {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Chain ID ${chainId} not supported. Supported: ${SUPPORTED_CHAINS_LIST}`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // ─── Inject markup calls (v3 monetization) ─────────────────────
+    // Percentage markup applies when the caller supplied a real
+    // transfer base. Flat markup applies when the caller only supplied
+    // a paymaster token (bridge, arbitrary txns). Either can be
+    // present, both, or neither; each markup helper safely returns
+    // null when its inputs are missing.
+    const augmentedCalls: Array<{ to: string; value?: string; data?: string }> = [...calls];
+    try {
+      const { getMarkupConfig, buildMarkupTransferCall, buildProjectMarkupTransferCall, getFlatMarkupConfig, buildFlatMarkupTransferCall } = await import('./markup');
+      const { encodeFunctionData } = await import('viem');
+
+      // Percentage markup on the transfer base.
+      if (transferTokenAddress && transferBaseAmountWei && ethers.utils.isAddress(transferTokenAddress)) {
+        let baseWei: bigint;
+        try {
+          baseWei = BigInt(transferBaseAmountWei);
+        } catch {
+          baseWei = 0n;
+        }
+        if (baseWei > 0n) {
+          const riftConfig = getMarkupConfig(markupBps);
+          const riftCall = buildMarkupTransferCall({
+            tokenAddress: transferTokenAddress as any,
+            transferAmountWei: baseWei,
+            config: riftConfig,
+          });
+          if (riftCall) {
+            augmentedCalls.push({
+              to: riftCall.to,
+              value: '0',
+              data: encodeFunctionData({
+                abi: riftCall.abi,
+                functionName: riftCall.functionName,
+                args: riftCall.args,
+              }),
+            });
+            console.log(`[markup-preview] Rift ${riftConfig.bps} bps → ${riftConfig.treasury} amount=${riftCall.args[1]}`);
+          }
+          const projectCall = buildProjectMarkupTransferCall({
+            tokenAddress: transferTokenAddress as any,
+            transferAmountWei: baseWei,
+            projectBps: projectMarkupBps,
+            projectTreasury: projectTreasuryAddress,
+          });
+          if (projectCall) {
+            augmentedCalls.push({
+              to: projectCall.to,
+              value: '0',
+              data: encodeFunctionData({
+                abi: projectCall.abi,
+                functionName: projectCall.functionName,
+                args: projectCall.args,
+              }),
+            });
+            console.log(`[markup-preview] Project ${projectMarkupBps} bps → ${projectCall.args[0]} amount=${projectCall.args[1]}`);
+          }
+        }
+      }
+
+      // Flat markup for non-transfer flows (bridge / arbitrary).
+      if (flatMarkupTokenAddress && ethers.utils.isAddress(flatMarkupTokenAddress)) {
+        const flatConfig = getFlatMarkupConfig();
+        const flatCall = buildFlatMarkupTransferCall({
+          tokenAddress: flatMarkupTokenAddress as any,
+          config: flatConfig,
+        });
+        if (flatCall) {
+          augmentedCalls.push({
+            to: flatCall.to,
+            value: '0',
+            data: encodeFunctionData({
+              abi: flatCall.abi,
+              functionName: flatCall.functionName,
+              args: flatCall.args,
+            }),
+          });
+          console.log(`[markup-preview] Flat markup ${flatConfig.amountWei} → ${flatConfig.treasury}`);
+        }
+      }
+    } catch (markupErr: any) {
+      // Never let a markup failure block a preview. Log + continue with
+      // the unmodified calls array. Missing markup is a revenue leak we
+      // can catch later; a failed preview is a broken UX.
+      console.warn('[markup-preview] failed to inject markup calls, continuing without:', markupErr?.message || markupErr);
+    }
+
+    const { previewUniversalTransaction } = await import('./twoPhase');
+    const result = await previewUniversalTransaction({
+      chainId,
+      rpcNodeProvider: rpcUrl,
+      calls: augmentedCalls,
+      ownerAddress,
+      ownerEncryptedKey,
+      bundlerUrl: chainConfig.bundlerUrl,
+      paymasterRPC: chainConfig.paymasterRPC,
+    });
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        user_op_hash_hex: result.userOpHashHex,
+        ticket_id: result.ticketId,
+        expires_at_ms: result.expiresAt,
+        ttl_ms: result.ttlMs,
+        smart_account_address: result.smartAccountAddress,
+        chain_id: chainId,
+      },
+      message: 'User op prepared. Sign user_op_hash_hex with your passkey / OIDC and POST to /api/transaction/submit-prepared.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/transaction/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'preview failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
+
+// Bridge preview — same two-phase pattern, but builds the
+// approve(SpokePool) + depositV3 calls via Across SDK first. Submit
+// uses the shared /api/transaction/submit-prepared (the ticket carries
+// chain + bundler config, no per-flow submit endpoint needed).
+router.post('/api/bridge/preview', checkRateLimit, async (req, res) => {
+  try {
+    const {
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amount,
+      ownerEncryptedKey,
+      ownerAddress,
+      rpcUrl,
+      recipient: explicitRecipient,
+    } = req.body as {
+      sourceChainId: number;
+      destChainId: number;
+      tokenAddress: string;
+      amount: number;
+      ownerEncryptedKey: string;
+      ownerAddress: string;
+      rpcUrl: string;
+      recipient?: string;
+    };
+
+    if (
+      !sourceChainId ||
+      !destChainId ||
+      !tokenAddress ||
+      !amount ||
+      !ownerEncryptedKey ||
+      !ownerAddress ||
+      !rpcUrl
+    ) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message:
+          'Required: sourceChainId, destChainId, tokenAddress, amount, ownerEncryptedKey, ownerAddress, rpcUrl',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    if (sourceChainId === destChainId) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Source and destination chains must differ',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const sourceChain = CHAINS[sourceChainId as keyof typeof CHAINS];
+    if (!sourceChain) {
+      res.status(400).json({
+        success: false,
+        error: 'Unsupported Chain',
+        message: `Source chain ID ${sourceChainId} is not supported.`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const chainConfig = getChainConfig(sourceChainId);
+    if (!chainConfig?.bundlerUrl || !chainConfig?.paymasterRPC) {
+      res.status(500).json({
+        success: false,
+        error: 'Configuration Error',
+        message: `Missing bundler/paymaster config for chain ${sourceChainId}`,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    // Compute the smart wallet address from ownerAddress (no key needed).
+    const publicClient = createPublicClient({
+      transport: http(rpcUrl),
+      chain: sourceChain,
+    });
+    const { makeSigner } = await import('./signerFactory');
+    const noKeySigner = await makeSigner({
+      envelopeBlob: ownerEncryptedKey,
+      kmsKeyArn: process.env.KMS_KEY_ARN || 'unused-for-address-derivation',
+      ownerAddress,
+    });
+    const smartAccount = await toSafeSmartAccount({
+      client: publicClient,
+      owners: [noKeySigner],
+      version: '1.4.1',
+    });
+    const smartWalletAddress = smartAccount.address;
+    const recipient =
+      explicitRecipient && ethers.utils.isAddress(explicitRecipient)
+        ? explicitRecipient
+        : smartWalletAddress;
+
+    // Token decimals + Across quote.
+    const tokenContract = new ethers.Contract(
+      tokenAddress,
+      ['function decimals() view returns (uint8)'],
+      new ethers.providers.JsonRpcProvider(rpcUrl)
+    );
+    const decimals = await tokenContract.decimals();
+    const amountInWei = ethers.utils
+      .parseUnits(amount.toString(), decimals)
+      .toString();
+
+    const { getAcrossQuote, buildBridgeCalls } = await import('./bridge');
+    const quote = await getAcrossQuote(
+      sourceChainId,
+      destChainId,
+      tokenAddress,
+      amountInWei,
+      recipient
+    );
+
+    const bridgeCalls = buildBridgeCalls(
+      quote,
+      smartWalletAddress,
+      recipient,
+      tokenAddress,
+      BigInt(amountInWei),
+      destChainId
+    );
+
+    // Bridge uses the flat markup (not percentage — bridge has no
+    // clean "transfer amount" base to charge against). We append a
+    // transfer(treasury, flat_fee) call to the bridge calls array so
+    // the same UserOp that runs the bridge also pays the fee.
+    const augmentedBridgeCalls: any[] = bridgeCalls.map((c: any) => ({
+      to: c.to as string,
+      value: c.value !== undefined ? String(c.value) : '0',
+      abi: c.abi,
+      functionName: c.functionName,
+      args: c.args,
+    }));
+    try {
+      const { getFlatMarkupConfig, buildFlatMarkupTransferCall } = await import('./markup');
+      const flatConfig = getFlatMarkupConfig();
+      const flatCall = buildFlatMarkupTransferCall({
+        tokenAddress: tokenAddress as any,
+        config: flatConfig,
+      });
+      if (flatCall) {
+        augmentedBridgeCalls.push({
+          to: flatCall.to,
+          value: '0',
+          abi: flatCall.abi,
+          functionName: flatCall.functionName,
+          args: flatCall.args,
+        });
+        console.log(`[markup-preview] Bridge flat markup ${flatConfig.amountWei} → ${flatConfig.treasury}`);
+      }
+    } catch (markupErr: any) {
+      console.warn('[markup-preview] bridge flat markup failed, continuing without:', markupErr?.message || markupErr);
+    }
+
+    // Hand to the generic preview — it will run prepareUserOperation
+    // over these ABI-style calls and stash the prepared UO + chain
+    // context in the ticket cache.
+    const { previewUniversalTransaction } = await import('./twoPhase');
+    const previewResult = await previewUniversalTransaction({
+      chainId: sourceChainId,
+      rpcNodeProvider: rpcUrl,
+      calls: augmentedBridgeCalls as any,
+      ownerAddress,
+      ownerEncryptedKey,
+      bundlerUrl: chainConfig.bundlerUrl,
+      paymasterRPC: chainConfig.paymasterRPC,
+    });
+
+    if (!previewResult.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: previewResult.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        user_op_hash_hex: previewResult.userOpHashHex,
+        ticket_id: previewResult.ticketId,
+        expires_at_ms: previewResult.expiresAt,
+        ttl_ms: previewResult.ttlMs,
+        smart_account_address: previewResult.smartAccountAddress,
+        chain_id: sourceChainId,
+        // Bridge-specific extras the client may want to display before
+        // the user signs (so they can see what they're approving):
+        bridge: {
+          source_chain_id: sourceChainId,
+          dest_chain_id: destChainId,
+          input_token: tokenAddress,
+          input_amount_wei: amountInWei,
+          output_token: quote.outputToken.address,
+          output_amount_wei: quote.outputAmount,
+          spoke_pool: quote.spokePoolAddress,
+          recipient,
+        },
+      },
+      message:
+        'Bridge UO prepared. Sign user_op_hash_hex with your passkey and POST to /api/transaction/submit-prepared.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/bridge/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'bridge preview failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
+
+router.post('/api/transaction/submit-prepared', checkRateLimit, async (req, res) => {
+  try {
+    const { ticketId, authProof } = req.body as {
+      ticketId?: string;
+      authProof?: {
+        kind: 'oidc' | 'passkey';
+        [k: string]: unknown;
+      };
+    };
+
+    if (!ticketId || !authProof || !authProof.kind) {
+      res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'ticketId and authProof (with kind=oidc|passkey) are required',
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    const { submitPreparedUniversalTransaction } = await import('./twoPhase');
+    const result = await submitPreparedUniversalTransaction({
+      ticketId,
+      authProof: authProof as any,
+    });
+
+    if (!result.success) {
+      res.status(400).json({
+        success: false,
+        error: 'Submit Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      } as any);
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        userOperationHash: result.userOperationHash,
+        transactionHash: result.transactionHash,
+        chainId: result.chainId,
+      },
+      message: 'User op submitted',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/transaction/submit-prepared] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'submit failed',
+      timestamp: new Date().toISOString(),
+    } as any);
+  }
+});
 
 router.post('/api/sign',  async (req, res) => {
   const {privateKey, chainId, rpcUrl} = req.body;
@@ -674,22 +1301,32 @@ router.post('/api/sign',  async (req, res) => {
 
 // ==================== SMART ACCOUNT ENDPOINTS ====================
 
-// Get smart account address endpoint
+// Get smart account address endpoint.
+//
+// Accepts `ownerAddress` (preferred — Phase-2 no-plaintext-on-wire) and
+// falls back to `ownerPrivateKey` for rollout-window compatibility with
+// older backend deploys. The Safe smart-account address is deterministic
+// from JUST the EOA's public address (CREATE2 with keccak256(owner) as
+// salt), so we never need the private key to compute it.
 router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
   try {
-    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body as {
+      chainId?: number;
+      ownerPrivateKey?: string;
+      ownerAddress?: string;
+      rpcUrl?: string;
+    };
+    let { ownerAddress } = req.body as { ownerAddress?: string };
 
-    // Validate required fields - we need private key to deterministically calculate address
-    if (!chainId || !ownerPrivateKey) {
+    if (!chainId || (!ownerAddress && !ownerPrivateKey)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'chainId and ownerPrivateKey are required',
+        message: 'chainId and ownerAddress (or legacy ownerPrivateKey) are required',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Validate chain support
     const chain = CHAINS[chainId as keyof typeof CHAINS];
     if (!chain) {
       return res.status(400).json({
@@ -700,20 +1337,29 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key format
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      console.log(`👤 Owner address: ${wallet.address}`);
-    } catch (error) {
+    // Derive ownerAddress from ownerPrivateKey only if the caller didn't
+    // give us one directly. This is the rollout shim — it goes away
+    // once every backend deploy is sending `ownerAddress`.
+    if (!ownerAddress) {
+      try {
+        ownerAddress = new ethers.Wallet(ownerPrivateKey as string).address;
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format (legacy field) — prefer `ownerAddress`',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Use provided RPC URL or default
     const defaultRpcUrls: Record<number, string> = {
       1: 'https://eth.llamarpc.com',
       8453: 'https://mainnet.base.org',
@@ -726,23 +1372,37 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
     };
     const finalRpcUrl = rpcUrl || defaultRpcUrls[chainId] || 'https://eth.llamarpc.com';
 
-    console.log(`🔍 Getting smart account address on chain ${chainId}`);
+    console.log(`🔍 Getting smart account address on chain ${chainId} for owner ${ownerAddress}`);
 
-    // Create public client
     const publicClient = createPublicClient({
       transport: http(finalRpcUrl),
-      chain
+      chain,
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
-    console.log(`👤 Owner address: ${signer.address}`);
-    
-    // Create Safe smart account to get the deterministic address
+    // No-key signer — viem's toAccount() lets us hand permissionless a
+    // signer object that knows its address but refuses to sign. The
+    // Safe SDK only needs `signer.address` to compute the deterministic
+    // smart-account address.
+    const viewOnlySigner = {
+      address: ownerAddress as `0x${string}`,
+      signMessage: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      signTransaction: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      signTypedData: async () => {
+        throw new Error('view-only signer cannot sign');
+      },
+      source: 'view-only',
+      type: 'local',
+      publicKey: '0x' as `0x${string}`,
+    } as any;
+
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
-      owners: [signer],
-      version: "1.4.1"
+      owners: [viewOnlySigner],
+      version: '1.4.1',
     });
 
     console.log(`🏦 Smart Account Address: ${smartAccount.address}`);
@@ -751,12 +1411,11 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
       success: true,
       data: {
         address: smartAccount.address,
-        chainId: chainId
+        chainId,
       },
       message: `Smart account address retrieved successfully for chain ${chainId}`,
       timestamp: new Date().toISOString(),
     });
-
   } catch (error: any) {
     console.error('Get smart account address error:', error);
     res.status(500).json({
@@ -768,17 +1427,34 @@ router.post('/api/smart-account/address', checkRateLimit, async (req, res) => {
   }
 });
 
-// Create smart account endpoint
+// Create smart account endpoint.
+//
+// Accepts EITHER:
+//   - `ownerAddress` (envelope mode — preferred; matches /smart-account/address)
+//   - `ownerPrivateKey` (legacy plaintext — kept for backwards compat)
+//
+// Safe smart-account addresses are CREATE2-deterministic from the EOA's
+// address alone (no key required), so this endpoint should never have
+// required the private key in the first place. Migrating brings it in
+// line with /address — any caller (current backend / older deploys /
+// envelope-only signup) just works.
 router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
   try {
-    const { chainId, ownerPrivateKey, rpcUrl } = req.body;
+    const { chainId, ownerPrivateKey, rpcUrl } = req.body as {
+      chainId?: number;
+      ownerPrivateKey?: string;
+      ownerAddress?: string;
+      rpcUrl?: string;
+    };
+    let { ownerAddress } = req.body as { ownerAddress?: string };
 
     // Validate required fields
-    if (!chainId || !ownerPrivateKey || !rpcUrl) {
+    if (!chainId || !rpcUrl || (!ownerAddress && !ownerPrivateKey)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'chainId, ownerPrivateKey, and rpcUrl are required',
+        message:
+          'chainId, rpcUrl, and ownerAddress (or legacy ownerPrivateKey) are required',
         timestamp: new Date().toISOString(),
       });
     }
@@ -794,20 +1470,30 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key format
-    try {
-      const wallet = new ethers.Wallet(ownerPrivateKey);
-      console.log(`👤 Owner address: ${wallet.address}`);
-    } catch (error) {
+    // Derive ownerAddress from ownerPrivateKey only when the caller
+    // didn't give us one directly. Rollout shim — goes away once every
+    // caller sends `ownerAddress`.
+    if (!ownerAddress) {
+      try {
+        ownerAddress = new ethers.Wallet(ownerPrivateKey as string).address;
+      } catch {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress format',
         timestamp: new Date().toISOString(),
       });
     }
 
-    console.log(`🏗️ Creating smart account on chain ${chainId}`);
+    console.log(`🏗️ Creating smart account on chain ${chainId} for owner ${ownerAddress}`);
 
     // Create public client
     const publicClient = createPublicClient({
@@ -815,14 +1501,30 @@ router.post('/api/smart-account/create', checkRateLimit, async (req, res) => {
       chain
     });
 
-    // Create signer from private key
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
-    console.log(`👤 Owner address: ${signer.address}`);
+    // Build a no-key viem account that just carries the address. Safe's
+    // address derivation only needs `owners[0].address`, so we never
+    // actually call signMessage / signTransaction here. If something
+    // accidentally tries to, it'll throw a clear error.
+    const { toAccount } = await import('viem/accounts');
+    const noKeySigner = toAccount({
+      address: ownerAddress as `0x${string}`,
+      async signMessage() {
+        throw new Error(
+          'no-key signer: /smart-account/create does not sign — address derivation only'
+        );
+      },
+      async signTransaction() {
+        throw new Error('no-key signer: /smart-account/create does not sign');
+      },
+      async signTypedData() {
+        throw new Error('no-key signer: /smart-account/create does not sign');
+      },
+    });
 
     // Create Safe smart account
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
-      owners: [signer],
+      owners: [noKeySigner],
       version: "1.4.1"
     });
 
@@ -877,7 +1579,15 @@ interface BridgeBody {
   destChainId: number;
   tokenAddress: string;
   amount: number;
-  ownerPrivateKey: string;
+  /** Local-mode plaintext key. Mutually exclusive with the enclave-mode
+   *  `ownerEncryptedKey + ownerAddress` pair. Optional now — validation
+   *  picks which path is required based on SIGNING_MODE. */
+  ownerPrivateKey?: string;
+  /** Phase-2 envelope-aware path. When the backend sends an envelope blob
+   *  via `ownerEncryptedKey`, it also sends `ownerAddress` so the enclave
+   *  signing path knows whose address to sign for without ever touching
+   *  plaintext. */
+  ownerAddress?: string;
   rpcUrl: string;
   recipient?: string; // optional, defaults to same smart wallet on dest chain
 }
@@ -1016,16 +1726,29 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       tokenAddress,
       amount,
       ownerPrivateKey,
+      ownerAddress,
       rpcUrl,
       recipient: explicitRecipient
     } = req.body as BridgeBody;
 
+    // Key material requirements depend on signing mode:
+    //   local mode  → `ownerPrivateKey` must be present
+    //   enclave mode → `ownerEncryptedKey` (envelope blob, in body) + `ownerAddress` are enough
+    const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
+      && (req.body as any).ownerEncryptedKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope && !!ownerAddress)
+      : !!ownerPrivateKey;
+
     // Validate required fields
-    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !ownerPrivateKey || !rpcUrl) {
+    if (!sourceChainId || !destChainId || !tokenAddress || !amount || !keyMaterialOk || !rpcUrl) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
+        message: inEnclaveMode
+          ? 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          : 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
         timestamp: new Date().toISOString(),
       });
     }
@@ -1068,25 +1791,47 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key
-    try {
-      new ethers.Wallet(ownerPrivateKey);
-    } catch (error) {
+    // Validate the key material. In local mode the private key must parse;
+    // in enclave mode the address must be well-formed (the envelope is
+    // opaque here and only the enclave can unseal it).
+    if (!inEnclaveMode) {
+      try {
+        new ethers.Wallet(ownerPrivateKey);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } else if (!ethers.utils.isAddress(ownerAddress!)) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Invalid private key format',
+        message: 'Invalid ownerAddress format',
         timestamp: new Date().toISOString(),
       });
     }
 
-    // Compute smart wallet address
+    // Compute smart wallet address. In enclave mode we use the no-key
+    // signer so the plaintext private key never enters this process.
     const publicClient = createPublicClient({
       transport: http(rpcUrl),
       chain: sourceChain
     });
 
-    const signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    let signer: any;
+    if (inEnclaveMode) {
+      const { makeSigner } = await import('./signerFactory');
+      signer = await makeSigner({
+        envelopeBlob: (req.body as any).ownerEncryptedKey,
+        kmsKeyArn: process.env.KMS_KEY_ARN || 'unused-for-address-derivation',
+        ownerAddress: ownerAddress!,
+      });
+    } else {
+      signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
+    }
     const smartAccount = await toSafeSmartAccount({
       client: publicClient,
       owners: [signer],
@@ -1170,7 +1915,28 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
     }
 
     // Execute bridge via smart account with ERC-20 paymaster (gas paid in the bridged token)
+    // Phase 1: pass envelope + KMS ARN + ownerAddress for enclave no-key routing.
     console.log(`🚀 Executing bridge transaction via smart account...`);
+    const bridgeSignerOpts: {
+      envelopeBlob?: string;
+      kmsKeyArn?: string;
+      ownerAddress?: string;
+      password?: string;
+      authProof?: import("./signingMode").AuthProof;
+    } = {};
+    const bridgeBlob = (req.body as any).ownerEncryptedKey;
+    if (typeof bridgeBlob === "string") bridgeSignerOpts.envelopeBlob = bridgeBlob;
+    if (process.env.KMS_KEY_ARN) bridgeSignerOpts.kmsKeyArn = process.env.KMS_KEY_ARN;
+    if (ownerAddress) bridgeSignerOpts.ownerAddress = ownerAddress;
+    const bridgePassword = (req.body as any).password;
+    if (typeof bridgePassword === "string" && bridgePassword.length > 0) {
+      bridgeSignerOpts.password = bridgePassword;
+    }
+    // v3 authProof (device-bound). Required if the envelope is v3.
+    const bridgeAuthProof = (req.body as any).authProof;
+    if (bridgeAuthProof && typeof bridgeAuthProof === "object") {
+      bridgeSignerOpts.authProof = bridgeAuthProof;
+    }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(
         sourceChainId,
@@ -1179,7 +1945,8 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
         ownerPrivateKey,
         chainConfig.bundlerUrl,
         chainConfig.paymasterRPC,
-        tokenAddress // pay gas in the token being bridged
+        tokenAddress, // pay gas in the token being bridged
+        bridgeSignerOpts
       )
     );
 
@@ -1224,16 +1991,53 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
 
 // ==================== WALLETCONNECT ENDPOINTS ====================
 
-// Pair with a DApp via WalletConnect URI
+// Pair with a DApp via WalletConnect URI.
+//
+// Accepts EITHER:
+//   - `ownerPrivateKey` (legacy local-mode)
+//   - `ownerEncryptedKey + ownerAddress` (envelope / enclave mode — v3)
+//
+// For v3 wallets, every individual dApp signing request submitted
+// through the resulting session must carry an `authProof` in the
+// /api/walletconnect/requests/:id/approve body. The session itself
+// doesn't store authProof — sessions outlive any single gesture.
 router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
   try {
-    const { uri, ownerPrivateKey, chainId, rpcUrl } = req.body;
+    const {
+      uri,
+      ownerPrivateKey,
+      ownerEncryptedKey,
+      ownerAddress,
+      chainId,
+      rpcUrl,
+    } = req.body as {
+      uri?: string;
+      ownerPrivateKey?: string;
+      ownerEncryptedKey?: string;
+      ownerAddress?: string;
+      chainId?: number;
+      rpcUrl?: string;
+    };
 
-    if (!uri || !ownerPrivateKey || !chainId) {
+    const inEnclaveMode =
+      (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
+    const hasEnvelope =
+      typeof ownerEncryptedKey === "string" &&
+      ownerEncryptedKey.length > 0 &&
+      typeof ownerAddress === "string" &&
+      ethers.utils.isAddress(ownerAddress);
+    const hasPrivateKey =
+      typeof ownerPrivateKey === "string" && ownerPrivateKey.length > 0;
+    const keyMaterialOk = inEnclaveMode
+      ? (hasEnvelope || hasPrivateKey)
+      : (hasPrivateKey || hasEnvelope);
+
+    if (!uri || !chainId || !keyMaterialOk) {
       return res.status(400).json({
         success: false,
         error: 'Validation Error',
-        message: 'Required fields: uri, ownerPrivateKey, chainId. Optional: rpcUrl',
+        message:
+          'Required: uri, chainId, and (ownerEncryptedKey + ownerAddress) OR ownerPrivateKey. Optional: rpcUrl.',
         timestamp: new Date().toISOString(),
       });
     }
@@ -1249,16 +2053,20 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate private key
-    try {
-      new ethers.Wallet(ownerPrivateKey);
-    } catch (error) {
-      return res.status(400).json({
-        success: false,
-        error: 'Validation Error',
-        message: 'Invalid private key format',
-        timestamp: new Date().toISOString(),
-      });
+    // Validate the key material that's actually present. Envelope is
+    // opaque here (only the enclave can unseal); for the plaintext path
+    // we sanity-check it parses as a private key.
+    if (hasPrivateKey) {
+      try {
+        new ethers.Wallet(ownerPrivateKey as string);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          error: 'Validation Error',
+          message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
     }
 
     // Resolve RPC, bundler, paymaster
@@ -1286,7 +2094,9 @@ router.post('/api/walletconnect/pair', checkRateLimit, async (req, res) => {
 
     const result = await pairAndApprove(
       uri,
-      ownerPrivateKey,
+      hasEnvelope
+        ? { ownerEncryptedKey, ownerAddress }
+        : { ownerPrivateKey },
       chainId,
       finalRpcUrl,
       chainConfig.bundlerUrl,
@@ -1377,6 +2187,67 @@ router.get('/api/walletconnect/requests', checkRateLimit, async (_req, res) => {
 });
 
 // Approve a pending WalletConnect request
+// v3 non-custodial preview: computes the hash the enclave will sign for
+// a pending WC request so the client can bind an authProof (WebAuthn
+// challenge / OIDC nonce) to that exact value before /approve runs the
+// signing. For eth_sendTransaction it also stashes the prepared UO in
+// the ticket cache — /approve then submits the cached op instead of
+// rebuilding one, guaranteeing the hash the client signed matches.
+//
+// Legacy (local-mode) sessions return { requiresAuthProof: false } and
+// can skip straight to /approve — this endpoint is a cheap no-op for them.
+router.post('/api/walletconnect/requests/:id/preview', checkRateLimit, async (req, res) => {
+  try {
+    const requestId = parseInt(req.params.id, 10);
+    if (isNaN(requestId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation Error',
+        message: 'Invalid request ID',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    const { previewSessionRequest } = await import('./walletconnect');
+    const result = await previewSessionRequest(requestId);
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: 'Preview Failed',
+        message: result.error,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        method: result.method,
+        peerName: result.peerName,
+        smart_account_address: result.smartWalletAddress,
+        chain_id: result.chainId,
+        hash_to_sign: result.hashToSign,
+        ticket_id: result.ticketId,
+        expires_at_ms: result.expiresAtMs,
+        ttl_ms: result.ttlMs,
+        requires_auth_proof: result.requiresAuthProof,
+      },
+      message: result.requiresAuthProof
+        ? 'Sign hash_to_sign with your passkey / OIDC and POST /approve with authProof.'
+        : 'Legacy session — approve() directly, no authProof needed.',
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[/api/walletconnect/requests/:id/preview] error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal Server Error',
+      message: error?.message || 'preview failed',
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 router.post('/api/walletconnect/requests/:id/approve', checkRateLimit, async (req, res) => {
   try {
     const requestId = parseInt(req.params.id, 10);
@@ -1389,7 +2260,12 @@ router.post('/api/walletconnect/requests/:id/approve', checkRateLimit, async (re
       });
     }
 
-    const result = await approveRequest(requestId);
+    // v3 (envelope-mode) sessions require an authProof on every approve.
+    // Legacy sessions ignore it. approveRequest enforces this by
+    // checking the session config — we just forward whatever the
+    // client sent.
+    const authProof = (req.body as any)?.authProof;
+    const result = await approveRequest(requestId, authProof);
     if (!result.success) {
       return res.status(404).json({
         success: false,

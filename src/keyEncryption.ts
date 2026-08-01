@@ -21,6 +21,24 @@ import { unwrapDataKey } from "./kms";
 const ENVELOPE_PREFIX = "enc:v1:";
 
 export async function decryptKey(blob: string): Promise<string> {
+  // v2 (password-bound) and v3 (device-bound) envelopes are NEVER
+  // decryptable here — they need the user's password or a Nitro
+  // enclave with pinned PCR0 respectively. If we get one it means the
+  // caller (route handler / middleware) didn't correctly route it to
+  // envelope-mode signing. Throw an unambiguous error so the failure
+  // reads "v2/v3 must not decrypt in-process" instead of the confusing
+  // "Legacy AES blob…" fallthrough.
+  if (blob.startsWith("enc:v2:")) {
+    throw new Error(
+      "v2 (password-bound) envelope cannot be decrypted in-process — the route must forward the blob to the enclave with the user's password"
+    );
+  }
+  if (blob.startsWith("enc:v3:")) {
+    throw new Error(
+      "v3 (device-bound) envelope cannot be decrypted in-process — the route must forward the blob to the enclave with the user's authProof (SIGNING_MODE must be 'enclave')"
+    );
+  }
+
   if (!blob.startsWith(ENVELOPE_PREFIX)) {
     return legacyDecrypt(blob);
   }
