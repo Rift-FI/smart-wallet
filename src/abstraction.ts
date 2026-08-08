@@ -73,7 +73,17 @@ export const submitTransaction = async (
   /** Project's own treasury address (required when projectMarkupBps > 0). */
   projectTreasuryAddress?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">
+  signerOptions?: Pick<
+    SignerOptions,
+    | "envelopeBlob"
+    | "kmsKeyArn"
+    | "ownerAddress"
+    | "password"
+    | "authProof"
+    | "route"
+    | "projectId"
+    | "signedConfig"
+  >
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -126,6 +136,13 @@ export const submitTransaction = async (
     if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
     if (signerOptions?.password) signerOpts.password = signerOptions.password;
     if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
+    if (signerOptions?.route) signerOpts.route = signerOptions.route;
+    // Per-project signed WebAuthn accept-list (v3-passkey only).
+    // Fetched by the route layer via loadProjectSignedAcceptConfig
+    // (projectId) and passed through. Absent → enclave uses hardcoded
+    // default policy. See rift-signer-enclave/enclave/src/project_config.rs.
+    if (signerOptions?.projectId) signerOpts.projectId = signerOptions.projectId;
+    if (signerOptions?.signedConfig) signerOpts.signedConfig = signerOptions.signedConfig;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 
@@ -420,7 +437,17 @@ export const submitUniversalTransaction = async (
   paymasterRPC: string,
   paymasterToken?: string,
   /** Envelope + KMS ARN — required in SIGNING_MODE=enclave to route signing through the Nitro enclave. */
-  signerOptions?: Pick<SignerOptions, "envelopeBlob" | "kmsKeyArn" | "ownerAddress" | "password" | "authProof">,
+  signerOptions?: Pick<
+    SignerOptions,
+    | "envelopeBlob"
+    | "kmsKeyArn"
+    | "ownerAddress"
+    | "password"
+    | "authProof"
+    | "route"
+    | "projectId"
+    | "signedConfig"
+  >,
 ): Promise<{
   success: boolean;
   transactionHash?: string;
@@ -477,6 +504,13 @@ export const submitUniversalTransaction = async (
     if (signerOptions?.ownerAddress) signerOpts.ownerAddress = signerOptions.ownerAddress;
     if (signerOptions?.password) signerOpts.password = signerOptions.password;
     if (signerOptions?.authProof) signerOpts.authProof = signerOptions.authProof;
+    if (signerOptions?.route) signerOpts.route = signerOptions.route;
+    // Per-project signed WebAuthn accept-list (v3-passkey only).
+    // Fetched by the route layer via loadProjectSignedAcceptConfig
+    // (projectId) and passed through. Absent → enclave uses hardcoded
+    // default policy. See rift-signer-enclave/enclave/src/project_config.rs.
+    if (signerOptions?.projectId) signerOpts.projectId = signerOptions.projectId;
+    if (signerOptions?.signedConfig) signerOpts.signedConfig = signerOptions.signedConfig;
     const signer = await makeSigner(signerOpts);
     console.log(`👤 Owner address: ${signer.address}`);
 

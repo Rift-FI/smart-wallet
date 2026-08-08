@@ -57,6 +57,24 @@ export interface SignerOptions {
    *  route layer after `resolveEnclaveConfig(projectId)` returned a
    *  config row. Null / undefined → env defaults (Rift-hosted flow). */
   route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
+  /** Rift-project-id the sign belongs to. v3-passkey path only. Bound
+   *  cryptographically to `signedConfig` inside the enclave — signature
+   *  from project A can't be replayed against project B's request. */
+  projectId?: string;
+  /** v3 / passkey path only. Rift-signed per-project WebAuthn
+   *  accept-list bundle. When present + verifies inside the enclave,
+   *  the enclave uses this project's accepted_origins + accepted_rp_ids
+   *  instead of the hardcoded default. Malformed / stale / wrong-project
+   *  bundle → enclave silently falls back to default policy (safe
+   *  degrade — Rift's own users unaffected).
+   *
+   *  Load via backend `loadProjectSignedAcceptConfig(projectId)` and
+   *  thread through here. Pass `signed_config_json` BYTE-FOR-BYTE —
+   *  the enclave hashes those exact bytes for signature verify. */
+  signedConfig?: {
+    signed_config_json: string;
+    signature_b64: string;
+  };
 }
 
 function ensure0xPrefix(s: string): Hex {
@@ -122,12 +140,16 @@ export async function makeSigner(opts: SignerOptions): Promise<Account> {
   const password = opts.password;
   const authProof = opts.authProof;
   const route = opts.route ?? null;
+  const projectId = opts.projectId;
+  const signedConfig = opts.signedConfig;
 
   // Shared enclave-sign closure used by signMessage / signTypedData /
   // the low-level sign primitive Safe's signing path eventually hits.
-  // The consent factor (password for v2, authProof for v3) and the
-  // per-request route override are closed over so every signature
-  // this signer produces carries them consistently.
+  // The consent factor (password for v2, authProof for v3), the
+  // per-request route override, and the per-project signed accept-list
+  // bundle are all closed over so every signature this signer produces
+  // carries them consistently. signedConfig ONLY matters for v3-passkey
+  // — signWithEnclave ignores it on v1/v2/OIDC paths.
   const enclaveSign = async (hashHex: Hex): Promise<Hex> => {
     const sig = await signWithEnclave({
       userOpHashHex: hashHex,
@@ -136,6 +158,8 @@ export async function makeSigner(opts: SignerOptions): Promise<Account> {
       ...(password !== undefined ? { password } : {}),
       ...(authProof !== undefined ? { authProof } : {}),
       ...(route ? { route } : {}),
+      ...(projectId ? { projectId } : {}),
+      ...(signedConfig ? { signedConfig } : {}),
     });
     if (sig === null) {
       throw new Error(
