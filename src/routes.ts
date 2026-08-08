@@ -686,6 +686,8 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       ownerAddress?: string;
       password?: string;
       authProof?: import("./signingMode").AuthProof;
+      projectId?: string;
+      signedConfig?: { signed_config_json: string; signature_b64: string };
     } = {};
     const universalBlob = (req.body as any).ownerEncryptedKey;
     if (typeof universalBlob === "string") universalSignerOpts.envelopeBlob = universalBlob;
@@ -700,6 +702,28 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
     const universalAuthProof = (req.body as any).authProof;
     if (universalAuthProof && typeof universalAuthProof === "object") {
       universalSignerOpts.authProof = universalAuthProof;
+    }
+    // v3 per-project signed WebAuthn accept-list (multi-tenant unblock).
+    // Passed through by the backend route layer after fetching from
+    // project_enclave_configs (accepted_origins + accepted_rp_ids +
+    // config_signature). Absent → enclave uses hardcoded default
+    // policy (Rift's own domains). See rift-signer-enclave/enclave/
+    // src/project_config.rs for the verify path.
+    const universalProjectId = (req.body as any).projectId;
+    if (typeof universalProjectId === "string" && universalProjectId.length > 0) {
+      universalSignerOpts.projectId = universalProjectId;
+    }
+    const universalSignedConfig = (req.body as any).signedConfig;
+    if (
+      universalSignedConfig &&
+      typeof universalSignedConfig === "object" &&
+      typeof universalSignedConfig.signed_config_json === "string" &&
+      typeof universalSignedConfig.signature_b64 === "string"
+    ) {
+      universalSignerOpts.signedConfig = {
+        signed_config_json: universalSignedConfig.signed_config_json,
+        signature_b64: universalSignedConfig.signature_b64,
+      };
     }
     const result = await paymasterCircuitBreaker.execute(() =>
       submitUniversalTransaction(

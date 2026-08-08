@@ -181,6 +181,36 @@ export async function signWithEnclave(params: {
    * tenant Rift-hosted flow).
    */
   route?: { parentProxyUrl: string; parentProxyBearer: string } | null;
+
+  /**
+   * Rift-project-id the sign request is scoped to. v3-passkey path
+   * only. Combined with `signedConfig` below, tells the enclave
+   * which project's per-project WebAuthn accept list to apply.
+   * Present without signedConfig → enclave uses hardcoded default
+   * (same as omitting both). Ignored on v1/v2/OIDC paths.
+   */
+  projectId?: string;
+
+  /**
+   * v3 / passkey path only. Rift-signed per-project WebAuthn
+   * accept-list bundle produced by the backend
+   * `projectConfigSigner.signProjectAcceptConfig`, retrieved via
+   * `loadProjectSignedAcceptConfig(projectId)`.
+   *
+   * When present + verifies inside the enclave, the enclave uses
+   * THIS project's accepted_origins + accepted_rp_ids instead of
+   * the hardcoded Rift-only default. Malformed / stale / wrong-
+   * project bundle → enclave silently falls back to hardcoded
+   * (never a hard error, so a bad config can't take down signing).
+   *
+   * Pass BYTE-FOR-BYTE the `signed_config_json` string from the
+   * signer/DB loader — do NOT JSON.parse + re-stringify; the
+   * enclave hashes these exact bytes for signature verification.
+   */
+  signedConfig?: {
+    signed_config_json: string;
+    signature_b64: string;
+  };
 }): Promise<Hex | null> {
   if (!isEnclaveMode()) return null;
 
@@ -209,6 +239,24 @@ export async function signWithEnclave(params: {
       auth_proof: params.authProof,
       kms_key_arn: params.kmsKeyArn,
     };
+    // Attach the signed per-project WebAuthn accept-list bundle if
+    // the caller resolved one for this project. Enclave verifies +
+    // uses it as the policy for THIS request. Absent bundle → enclave
+    // falls back to hardcoded default (Rift's own domains) — same
+    // behaviour as before this field existed. See
+    // rift-signer-enclave/enclave/src/project_config.rs.
+    //
+    // Pass BYTE-FOR-BYTE. Enclave hashes signed_config_json as-is;
+    // any re-serialisation between here and the enclave would break
+    // the signature verification and silently degrade to the default
+    // policy.
+    if (params.signedConfig) {
+      body.signed_config_json = params.signedConfig.signed_config_json;
+      body.signed_config_signature_b64 = params.signedConfig.signature_b64;
+    }
+    if (params.projectId) {
+      body.project_id = params.projectId;
+    }
   } else if (params.envelopeBlob.startsWith("enc:v2:")) {
     if (!params.password) {
       console.warn(
