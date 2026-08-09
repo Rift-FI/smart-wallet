@@ -1241,6 +1241,14 @@ router.post('/api/transaction/submit-prepared', checkRateLimit, async (req, res)
       return;
     }
 
+    // Diagnostic: log whether Option C fields arrived. If projectId is
+    // (none) or signedConfigLen is 0 when backend claims to have sent
+    // them, this handler is running old code — force a redeploy.
+    console.log(
+      `[/api/transaction/submit-prepared] projectId=${projectId ?? '(none)'} ` +
+        `signedConfigLen=${signedConfig?.signed_config_json?.length ?? 0}`,
+    );
+
     const { submitPreparedUniversalTransaction } = await import('./twoPhase');
     const result = await submitPreparedUniversalTransaction({
       ticketId,
