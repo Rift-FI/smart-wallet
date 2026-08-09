@@ -390,6 +390,11 @@ export async function submitPreparedUniversalTransaction(params: {
     if (ticket.kmsKeyArn) signerOpts.kmsKeyArn = ticket.kmsKeyArn;
     if (params.projectId) signerOpts.projectId = params.projectId;
     if (params.signedConfig) signerOpts.signedConfig = params.signedConfig;
+    console.log(
+      `[submitPreparedUniversalTransaction] threading Option C → ` +
+        `projectId=${signerOpts.projectId ?? "(none)"} ` +
+        `signedConfigLen=${signerOpts.signedConfig?.signed_config_json?.length ?? 0}`,
+    );
     const signer = await makeSigner(signerOpts);
 
     const smartAccount = await toSafeSmartAccount({
