@@ -1215,11 +1215,19 @@ router.post('/api/bridge/preview', checkRateLimit, async (req, res) => {
 
 router.post('/api/transaction/submit-prepared', checkRateLimit, async (req, res) => {
   try {
-    const { ticketId, authProof } = req.body as {
+    const { ticketId, authProof, projectId, signedConfig } = req.body as {
       ticketId?: string;
       authProof?: {
         kind: 'oidc' | 'passkey';
         [k: string]: unknown;
+      };
+      // Option C: forwarded from backend so the enclave can honour
+      // the caller project's own accept list instead of the hardcoded
+      // Rift default. Optional — Rift's own users omit both.
+      projectId?: string;
+      signedConfig?: {
+        signed_config_json: string;
+        signature_b64: string;
       };
     };
 
@@ -1237,6 +1245,8 @@ router.post('/api/transaction/submit-prepared', checkRateLimit, async (req, res)
     const result = await submitPreparedUniversalTransaction({
       ticketId,
       authProof: authProof as any,
+      projectId,
+      signedConfig,
     });
 
     if (!result.success) {
