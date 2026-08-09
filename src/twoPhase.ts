@@ -343,6 +343,15 @@ export async function previewUniversalTransaction(params: {
 export async function submitPreparedUniversalTransaction(params: {
   ticketId: string;
   authProof: AuthProof;
+  // Option C: per-project signed WebAuthn accept list. Passed through
+  // to the enclave via signRemote so non-Rift origins (Blockfinax etc)
+  // pass the origin/rpIdHash check. Absent → enclave uses hardcoded
+  // Rift-only defaults (existing Rift users unaffected).
+  projectId?: string;
+  signedConfig?: {
+    signed_config_json: string;
+    signature_b64: string;
+  };
 }): Promise<{
   success: boolean;
   userOperationHash?: string;
@@ -379,6 +388,8 @@ export async function submitPreparedUniversalTransaction(params: {
       authProof: params.authProof,
     };
     if (ticket.kmsKeyArn) signerOpts.kmsKeyArn = ticket.kmsKeyArn;
+    if (params.projectId) signerOpts.projectId = params.projectId;
+    if (params.signedConfig) signerOpts.signedConfig = params.signedConfig;
     const signer = await makeSigner(signerOpts);
 
     const smartAccount = await toSafeSmartAccount({
