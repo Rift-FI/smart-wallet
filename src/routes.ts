@@ -158,12 +158,20 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
 
     // Key material requirements depend on signing mode:
     //   local mode  → `ownerPrivateKey` must be present
-    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    //   enclave mode → either
+    //     (a) `ownerEncryptedKey` + `ownerAddress` (v1/v2/v3 envelope, signed
+    //         via enclave), OR
+    //     (b) `ownerPrivateKey` (legacy caller who decrypted server-side —
+    //         makeSigner already falls back to local signing when the
+    //         envelope is absent, see signerFactory.ts:123-136).
+    // (b) exists so legacy wallets that never migrated to v3 (their
+    // encrypted_keys blob is raw `<iv>:<ct>`, decrypted by backend with
+    // ENCRYPTION_KEY) keep working after the enclave rollout.
     const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
     const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
       && (req.body as any).ownerEncryptedKey.length > 0;
     const keyMaterialOk = inEnclaveMode
-      ? (hasEnvelope && !!ownerAddress)
+      ? ((hasEnvelope && !!ownerAddress) || !!ownerPrivateKey)
       : !!ownerPrivateKey;
 
     if (!chainId || !tokenAddress || !recipient || !amount || !keyMaterialOk || !ownerAddress || !rpcUrl) {
@@ -171,7 +179,7 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
         success: false,
         error: 'Validation Error',
         message: inEnclaveMode
-          ? 'All fields required: chainId, tokenAddress, recipient, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          ? 'All fields required: chainId, tokenAddress, recipient, amount, (ownerEncryptedKey OR ownerPrivateKey), ownerAddress, rpcUrl'
           : 'All fields required: chainId, tokenAddress, recipient, amount, ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
@@ -200,12 +208,13 @@ router.post('/api/transfer', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key — local mode only. In
-    // enclave mode the plaintext key never enters this process so
-    // there's nothing to verify against; `ownerAddress` is taken on
-    // trust (parent-proxy /sign produces a signature recoverable to
-    // that address, or fails).
-    if (!inEnclaveMode) {
+    // Verify owner address matches private key whenever a plaintext key
+    // is present — including the enclave-mode legacy fallback path. When
+    // enclave mode is on AND the caller sent only an envelope (no plaintext
+    // key), there's nothing to verify against and `ownerAddress` is taken
+    // on trust (parent-proxy /sign returns a signature recoverable to that
+    // address, or fails).
+    if (ownerPrivateKey) {
       try {
         const wallet = new ethers.Wallet(ownerPrivateKey);
         if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
@@ -526,12 +535,17 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
 
     // Key material requirements depend on signing mode:
     //   local mode  → `ownerPrivateKey` must be present
-    //   enclave mode → `ownerEncryptedKey` (in body) + `ownerAddress` are enough
+    //   enclave mode → either
+    //     (a) `ownerEncryptedKey` + `ownerAddress` (v1/v2/v3 envelope, signed
+    //         via enclave), OR
+    //     (b) `ownerPrivateKey` (legacy caller that decrypted server-side;
+    //         makeSigner falls back to local signing — signerFactory.ts:123-136).
+    // (b) is the legacy path — wallets that never migrated to v3 keep working.
     const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
     const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
       && (req.body as any).ownerEncryptedKey.length > 0;
     const keyMaterialOk = inEnclaveMode
-      ? (hasEnvelope && !!ownerAddress)
+      ? ((hasEnvelope && !!ownerAddress) || !!ownerPrivateKey)
       : !!ownerPrivateKey;
 
     // Validate required fields
@@ -540,7 +554,7 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
         success: false,
         error: 'Validation Error',
         message: inEnclaveMode
-          ? 'All fields required: chainId, calls (non-empty array), ownerEncryptedKey, ownerAddress, rpcUrl'
+          ? 'All fields required: chainId, calls (non-empty array), (ownerEncryptedKey OR ownerPrivateKey), ownerAddress, rpcUrl'
           : 'All fields required: chainId, calls (non-empty array), ownerPrivateKey, ownerAddress, rpcUrl',
         timestamp: new Date().toISOString(),
       } as any);
@@ -614,12 +628,13 @@ router.post('/api/transaction', checkRateLimit, async (req, res: TypedResponse<{
       return;
     }
 
-    // Verify owner address matches private key — local mode only. In
-    // enclave mode the plaintext key never enters this process so
-    // there's nothing to verify against; `ownerAddress` is taken on
-    // trust (parent-proxy /sign produces a signature recoverable to
-    // that address, or fails).
-    if (!inEnclaveMode) {
+    // Verify owner address matches private key whenever a plaintext key
+    // is present — including the enclave-mode legacy fallback path. When
+    // enclave mode is on AND the caller sent only an envelope (no plaintext
+    // key), there's nothing to verify against and `ownerAddress` is taken
+    // on trust (parent-proxy /sign returns a signature recoverable to that
+    // address, or fails).
+    if (ownerPrivateKey) {
       try {
         const wallet = new ethers.Wallet(ownerPrivateKey);
         if (wallet.address.toLowerCase() !== ownerAddress.toLowerCase()) {
@@ -1775,12 +1790,17 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
 
     // Key material requirements depend on signing mode:
     //   local mode  → `ownerPrivateKey` must be present
-    //   enclave mode → `ownerEncryptedKey` (envelope blob, in body) + `ownerAddress` are enough
+    //   enclave mode → either
+    //     (a) `ownerEncryptedKey` + `ownerAddress` (v1/v2/v3 envelope, signed
+    //         via enclave), OR
+    //     (b) `ownerPrivateKey` (legacy caller that decrypted server-side;
+    //         makeSigner falls back to local signing — signerFactory.ts:123-136).
+    // (b) is the legacy path — wallets that never migrated to v3 keep working.
     const inEnclaveMode = (process.env.SIGNING_MODE || "").trim().toLowerCase() === "enclave";
     const hasEnvelope = typeof (req.body as any).ownerEncryptedKey === "string"
       && (req.body as any).ownerEncryptedKey.length > 0;
     const keyMaterialOk = inEnclaveMode
-      ? (hasEnvelope && !!ownerAddress)
+      ? ((hasEnvelope && !!ownerAddress) || !!ownerPrivateKey)
       : !!ownerPrivateKey;
 
     // Validate required fields
@@ -1789,7 +1809,7 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
         success: false,
         error: 'Validation Error',
         message: inEnclaveMode
-          ? 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerEncryptedKey, ownerAddress, rpcUrl'
+          ? 'All fields required: sourceChainId, destChainId, tokenAddress, amount, (ownerEncryptedKey OR ownerPrivateKey), ownerAddress, rpcUrl'
           : 'All fields required: sourceChainId, destChainId, tokenAddress, amount, ownerPrivateKey, rpcUrl',
         timestamp: new Date().toISOString(),
       });
@@ -1833,17 +1853,28 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Validate the key material. In local mode the private key must parse;
-    // in enclave mode the address must be well-formed (the envelope is
-    // opaque here and only the enclave can unseal it).
-    if (!inEnclaveMode) {
+    // Validate the key material. Whenever a plaintext private key is
+    // present (local mode, or enclave-mode legacy fallback), it must parse
+    // AND match `ownerAddress` if one was supplied. In envelope-only enclave
+    // mode the plaintext never enters this process — we just need
+    // `ownerAddress` to be well-formed.
+    if (ownerPrivateKey) {
+      let derivedAddress: string;
       try {
-        new ethers.Wallet(ownerPrivateKey);
+        derivedAddress = new ethers.Wallet(ownerPrivateKey).address;
       } catch (error) {
         return res.status(400).json({
           success: false,
           error: 'Validation Error',
           message: 'Invalid private key format',
+          timestamp: new Date().toISOString(),
+        });
+      }
+      if (ownerAddress && derivedAddress.toLowerCase() !== ownerAddress.toLowerCase()) {
+        return res.status(400).json({
+          success: false,
+          error: 'Authentication Error',
+          message: 'Private key does not match owner address',
           timestamp: new Date().toISOString(),
         });
       }
@@ -1856,15 +1887,17 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
       });
     }
 
-    // Compute smart wallet address. In enclave mode we use the no-key
-    // signer so the plaintext private key never enters this process.
+    // Compute smart wallet address. In enclave-envelope mode we use the
+    // no-key signer so plaintext never enters this process. In the legacy
+    // fallback (enclave mode + only privateKey), makeSigner drops to local
+    // signing via signerFactory.ts:123-136.
     const publicClient = createPublicClient({
       transport: http(rpcUrl),
       chain: sourceChain
     });
 
     let signer: any;
-    if (inEnclaveMode) {
+    if (inEnclaveMode && hasEnvelope) {
       const { makeSigner } = await import('./signerFactory');
       signer = await makeSigner({
         envelopeBlob: (req.body as any).ownerEncryptedKey,
@@ -1872,6 +1905,8 @@ router.post('/api/bridge', checkRateLimit, async (req, res) => {
         ownerAddress: ownerAddress!,
       });
     } else {
+      // Either SIGNING_MODE=local, or enclave-mode legacy fallback with
+      // only a plaintext key. Both sign locally with the raw private key.
       signer = privateKeyToAccount(ownerPrivateKey as `0x${string}`);
     }
     const smartAccount = await toSafeSmartAccount({
