@@ -172,3 +172,5 @@ private-keys/
 wallets/
 *.key
 *.pem
+# Local-only debug script; contained secrets (removed from tracking)
+decrypt.js
