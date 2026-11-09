@@ -1,28 +1,26 @@
 /**
- * In-memory ticket cache for two-phase UserOperation signing.
+ * In-memory ticket cache for two-phase passkey signing.
  *
  * Why this exists:
- *   v3 envelopes are device-bound. Every signature requires an authProof
- *   (WebAuthn assertion or OIDC id_token) whose challenge/nonce MUST equal
- *   the user_op_hash being signed. The hash isn't known until the smart-
- *   wallet has built the user op (gas estimates, paymaster data, nonce).
- *   So the client can't sign upfront.
+ *   Every UserOp / message is signed by the user's passkey on their
+ *   device. The hash to sign (SafeOp / SafeMessage EIP-712 hash) isn't
+ *   known until the smart-wallet has built the op (gas, paymaster data,
+ *   nonce), so the client can't sign upfront.
  *
  * Two-phase flow:
- *   1. Client POSTs to /api/transaction/preview → smart-wallet builds the
- *      user op, returns { user_op_hash_hex, ticket_id }, stashes the
- *      prepared op here.
- *   2. Client signs user_op_hash_hex with their passkey / OIDC.
- *   3. Client POSTs to /api/transaction/submit-prepared with
- *      { ticket_id, authProof }. Smart-wallet retrieves the prepared op,
- *      signs via parent-proxy /sign with authProof, submits to bundler.
+ *   1. prepare → smart-wallet builds the unsigned op, returns
+ *      { ticketId, hashToSign }, stashes the op here.
+ *   2. Client signs hashToSign with a passkey (WebAuthn challenge).
+ *   3. submit { ticketId, signer, authProof } → smart-wallet encodes the
+ *      Safe contract signature, verifies it, submits to the bundler.
  *
  * Single-process in-memory Map is fine: smart-wallet is currently a
  * single Node instance (Caprover container, no HA). For multi-instance
  * deploys we'd swap this for Redis with the same interface.
  *
- * TTL: 60s — long enough for a user to tap Touch ID, short enough that
- * stale tickets (with stale gas prices) can't be replayed.
+ * TTL: 120s by default (TICKET_TTL_MS) — long enough for a user to sign
+ * a few chains in a row, short enough that stale gas prices / paymaster
+ * signatures can't be replayed.
  */
 
 import { randomBytes } from "crypto";
@@ -34,7 +32,10 @@ interface TicketEntry<T> {
 
 const tickets = new Map<string, TicketEntry<unknown>>();
 
-const TTL_MS = 60_000;
+const TTL_MS = (() => {
+  const raw = Number(process.env.TICKET_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+})();
 
 // Lazy cleanup on every lookup is enough — the cache stays small.
 // No need for a setInterval that holds the event loop open.
@@ -62,6 +63,18 @@ export function consumeTicket<T>(ticketId: string): T | null {
   // even within its TTL window.
   tickets.delete(ticketId);
   if (entry.expiresAt <= now) return null;
+  return entry.value as T;
+}
+
+/**
+ * Read a ticket WITHOUT consuming it — submit validates the signature
+ * first (so a bad proof doesn't burn the ticket), then consumes.
+ */
+export function peekTicket<T>(ticketId: string): T | null {
+  const now = Date.now();
+  evictExpired(now);
+  const entry = tickets.get(ticketId);
+  if (!entry || entry.expiresAt <= now) return null;
   return entry.value as T;
 }
 

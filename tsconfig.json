@@ -21,7 +21,14 @@
     "noUnusedParameters": true,
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true
+    "noImplicitOverride": true,
+    "baseUrl": ".",
+    // permissionless ships raw .ts next to its .d.ts; under node10 resolution
+    // tsc would type-check those sources. Point sub-paths at the published types
+    // (runtime require() still resolves via the package exports to _cjs).
+    "paths": {
+      "permissionless/*": ["node_modules/permissionless/_types/*"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]

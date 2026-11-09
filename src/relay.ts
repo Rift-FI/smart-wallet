@@ -22,7 +22,7 @@ import { toSafeSmartAccount } from "permissionless/accounts";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
 import { createSmartAccountClient } from "permissionless";
 import { ethers } from "ethers";
-import { CHAINS } from "./abstraction";
+import { CHAINS } from "./chainConfig";
 import {
   isCeloChain,
   isCeloSupportedToken,
@@ -259,7 +259,7 @@ async function prepareUserOp(
   smartAccount: any,
   chain: any,
   chainId: number,
-  rpcUrl: string,
+  _rpcUrl: string,
   bundlerUrl: string,
   paymasterRPC: string,
   calls: any[],

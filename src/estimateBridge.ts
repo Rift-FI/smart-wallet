@@ -19,7 +19,6 @@
 import "dotenv/config";
 import { ethers } from "ethers";
 import { createSmartAccountClient } from "permissionless";
-import { toSafeSmartAccount } from "permissionless/accounts";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
 import {
   createPublicClient,
@@ -29,8 +28,8 @@ import {
   parseAbi,
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
-import { toAccount } from "viem/accounts";
-import { CHAINS } from "./abstraction";
+import { CHAINS } from "./chainConfig";
+import { estimationAccount } from "./passkey/account";
 import { getAcrossQuote, buildBridgeCalls, type BridgeQuoteResponse } from "./bridge";
 import { buildPaymasterApproveCalls } from "./paymasterApprove";
 import { getFlatMarkupConfig, buildFlatMarkupTransferCall } from "./markup";
@@ -40,7 +39,10 @@ export interface EstimateBridgeArgs {
   destChainId: number;
   tokenAddress: string;
   amount: number;
-  ownerAddress: string;
+  /** Legacy: EOA owner of a pre-migration Safe. Prefer `account`. */
+  ownerAddress?: string;
+  /** AccountRef (passkey_native | migrated), see passkey/account.ts. */
+  account?: unknown;
   /** Recipient on the destination chain. Defaults to smart-wallet address. */
   recipient?: string;
   rpcUrl: string;
@@ -99,20 +101,6 @@ export interface EstimateBridgeResult {
   data?: EstimateBridgeData;
 }
 
-function stubSignerFromAddress(address: string) {
-  return toAccount({
-    address: address as Address,
-    async signMessage() {
-      throw new Error("estimateBridge: stub signer cannot sign");
-    },
-    async signTransaction() {
-      throw new Error("estimateBridge: stub signer cannot sign");
-    },
-    async signTypedData() {
-      throw new Error("estimateBridge: stub signer cannot sign");
-    },
-  });
-}
 
 export async function estimateBridge(
   args: EstimateBridgeArgs
@@ -149,12 +137,7 @@ export async function estimateBridge(
     });
 
     // Derive smart account address from owner (read-only path).
-    const stubSigner = stubSignerFromAddress(args.ownerAddress);
-    const smartAccount = await toSafeSmartAccount({
-      client: publicClient,
-      owners: [stubSigner],
-      version: "1.4.1",
-    });
+    const smartAccount = await estimationAccount(publicClient as any, args.sourceChainId, args);
 
     const decimalsRaw = await publicClient.readContract({
       abi: parseAbi(["function decimals() view returns (uint8)"]),

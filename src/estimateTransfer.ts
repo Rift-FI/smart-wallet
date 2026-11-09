@@ -1,7 +1,7 @@
 /**
  * Estimate the **gas fee, in the token being sent**, for an ERC-20 transfer
  * via our ERC-4337 smart account + paymaster setup. Mirrors the build path
- * of submitTransaction() in abstraction.ts but stops at
+ * of a real transfer prepare (passkey/service.ts) but stops at
  * `prepareUserOperation` — never signs, never submits.
  *
  * Why this matters: on Ethereum mainnet the paymaster's gas fee in USDC/USDT
@@ -13,17 +13,14 @@
  *      before they tap Send.
  *   2. Hard-block submission when balance < totalNeeded.
  *
- * Read-only: takes an ownerAddress, not a private key. The smart account is
- * deterministically derived from the owner so we can prepare a UserOp
- * without ever needing to sign anything. A stub viem Account is passed to
- * permissionless's toSafeSmartAccount() — its signing methods throw if
- * accidentally invoked, but `prepareUserOperation` never invokes them.
+ * Read-only: takes an AccountRef (or a legacy ownerAddress), never a key.
+ * The Safe account is built without a signer; `prepareUserOperation`
+ * only uses its stub signature (WebAuthn-shaped for passkey accounts).
  */
 
 import "dotenv/config";
 import { ethers } from "ethers";
 import { createSmartAccountClient } from "permissionless";
-import { toSafeSmartAccount } from "permissionless/accounts";
 import { createPimlicoClient } from "permissionless/clients/pimlico";
 import {
   createPublicClient,
@@ -34,8 +31,8 @@ import {
   parseAbi,
 } from "viem";
 import { entryPoint07Address, EntryPointVersion } from "viem/account-abstraction";
-import { toAccount } from "viem/accounts";
-import { CHAINS } from "./abstraction";
+import { CHAINS } from "./chainConfig";
+import { estimationAccount } from "./passkey/account";
 import {
   isCeloChain,
   isCeloSupportedToken,
@@ -57,7 +54,10 @@ export interface EstimateTransferArgs {
   tokenAddress: string;
   amount: number; // human-readable, e.g. 100 for "100 USDC"
   recipient: string;
-  ownerAddress: string;
+  /** Legacy: EOA owner of a pre-migration Safe. Prefer `account`. */
+  ownerAddress?: string;
+  /** AccountRef (passkey_native | migrated), see passkey/account.ts. */
+  account?: unknown;
   bundlerUrl: string;
   paymasterRPC: string;
   /** Per-key markup override (bps). Undefined → MARKUP_BPS env default. */
@@ -123,20 +123,6 @@ export interface EstimateTransferResult {
  * Build a viem Account that ONLY exposes the address. Signing methods
  * throw — they're never called by `prepareUserOperation`.
  */
-function stubSignerFromAddress(address: string) {
-  return toAccount({
-    address: address as Address,
-    async signMessage() {
-      throw new Error("estimateTransfer: stub signer cannot sign");
-    },
-    async signTransaction() {
-      throw new Error("estimateTransfer: stub signer cannot sign");
-    },
-    async signTypedData() {
-      throw new Error("estimateTransfer: stub signer cannot sign");
-    },
-  });
-}
 
 export async function estimateTransfer(
   args: EstimateTransferArgs
@@ -161,13 +147,8 @@ export async function estimateTransfer(
       },
     });
 
-    // Address-only owner → SAFE smart account address is deterministic.
-    const stubSigner = stubSignerFromAddress(args.ownerAddress);
-    const smartAccount = await toSafeSmartAccount({
-      client: publicClient,
-      owners: [stubSigner],
-      version: "1.4.1",
-    });
+    // AccountRef (passkey / migrated) or legacy ownerAddress → Safe account.
+    const smartAccount = await estimationAccount(publicClient as any, args.chainId, args);
 
     // Token decimals + current balance.
     const decimalsRaw = await publicClient.readContract({

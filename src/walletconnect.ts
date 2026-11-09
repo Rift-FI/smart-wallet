@@ -2,35 +2,36 @@ import "dotenv/config";
 import { Core } from "@walletconnect/core";
 import { Web3Wallet, Web3WalletTypes, IWeb3Wallet } from "@walletconnect/web3wallet";
 import { buildApprovedNamespaces, getSdkError } from "@walletconnect/utils";
-import { ethers } from "ethers";
-import { createPublicClient, http } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { toSafeSmartAccount } from "permissionless/accounts";
-import { CHAINS } from "./abstraction";
-import { submitUniversalTransaction } from "./abstraction";
-import { makeSigner } from "./signerFactory";
-import type { AuthProof } from "./signingMode";
+import { isHex, type Hex } from "viem";
+import { getPublicClient } from "./chainConfig";
+import { parseAccountRef, resolveAccount, serialiseAccountRef } from "./passkey/account";
+import { PasskeyError } from "./passkey/errors";
+import {
+  assertChain,
+  prepareMessage,
+  prepareOperation,
+  submitMessage,
+  submitOperation,
+} from "./passkey/service";
 
-// Session store: maps WC topic → user config.
+// WalletConnect runs server-side (WalletKit) so SDK / app clients don't
+// have to hold a session. Every signing request is two-phase:
 //
-// Either `ownerPrivateKey` (legacy local-mode) OR
-// `ownerEncryptedKey + ownerAddress` (envelope / enclave mode). The pair
-// endpoint picks one when the session is established; downstream
-// signing handlers use whichever is present.
+//   POST /api/walletconnect/requests/:id/preview → { hashToSign, ticketId }
+//     (SafeOp hash for eth_sendTransaction, SafeMessage hash for signatures)
+//   client passkey-signs hashToSign
+//   POST /api/walletconnect/requests/:id/approve { authProof, signer }
+//     → submits the UserOp / returns the ERC-1271 (ERC-6492 if undeployed)
+//       signature to the dApp.
 //
-// For v3 (device-bound) wallets, every individual dApp signing request
-// must additionally carry a fresh `authProof` bound to that request's
-// hash. authProof is supplied per-approve call, NOT stored on the
-// session — sessions outlive any single user gesture.
+// No key material is ever stored on a session — only the AccountRef.
+
 interface SessionConfig {
-  ownerPrivateKey?: string;
-  ownerEncryptedKey?: string;
-  ownerAddress: string;
+  /** Serialised AccountRef (passkey_native | migrated). */
+  account: Record<string, unknown>;
   smartWalletAddress: string;
   chainId: number;
-  rpcUrl: string;
-  bundlerUrl: string;
-  paymasterRPC: string;
+  rpcUrl?: string;
 }
 
 // Pending request store
@@ -45,8 +46,19 @@ export interface PendingRequest {
   createdAt: string;
 }
 
+const SIGNING_METHODS = new Set([
+  "eth_sendTransaction",
+  "personal_sign",
+  "eth_sign",
+  "eth_signTypedData",
+  "eth_signTypedData_v3",
+  "eth_signTypedData_v4",
+]);
+
 const sessions = new Map<string, SessionConfig>();
 const pendingRequests = new Map<number, { pending: PendingRequest; sessionConfig: SessionConfig }>();
+// Ticket from preview, consumed by approve. Cleared on approve / reject.
+const wcTicketByRequestId = new Map<number, { ticketId: string; kind: "userop" | "message"; expiresAt: number }>();
 let web3wallet: IWeb3Wallet | null = null;
 
 // Event callbacks for real-time updates
@@ -92,13 +104,13 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
     // Proposals are approved explicitly via the pair endpoint
   });
 
-  // Handle session requests (DApp sends a transaction/sign request)
-  // Instead of auto-signing, queue as pending for user approval
+  // Handle session requests (DApp sends a transaction/sign request).
+  // Never auto-signed: queued until the user approves with a passkey.
   web3wallet.on("session_request", async (event) => {
     const { topic, params, id } = event;
     const { request } = params;
 
-    console.log(`📥 WC session_request [${request.method}]:`, JSON.stringify(request.params).slice(0, 300));
+    console.log(`📥 WC session_request [${request.method}]`);
 
     const sessionConfig = sessions.get(topic);
     if (!sessionConfig) {
@@ -114,26 +126,23 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
       return;
     }
 
-    // Get peer name from active sessions
     const activeSessions = web3wallet!.getActiveSessions();
     const session = activeSessions[topic];
     const peerName = session?.peer?.metadata?.name || "Unknown DApp";
 
-    // Queue the request for user approval
-    const pending: PendingRequest = {
-      id,
-      topic,
-      method: request.method,
-      params: request.params,
-      peerName,
-      chainId: sessionConfig.chainId,
-      smartWalletAddress: sessionConfig.smartWalletAddress,
-      createdAt: new Date().toISOString(),
-    };
-
-    pendingRequests.set(id, { pending, sessionConfig });
-    console.log(`⏳ Request ${id} queued for approval: ${request.method} from ${peerName}`);
-    emitEvent({ type: "pending_request", topic, data: pending });
+    queuePendingRequest(
+      {
+        id,
+        topic,
+        method: request.method,
+        params: request.params,
+        peerName,
+        chainId: sessionConfig.chainId,
+        smartWalletAddress: sessionConfig.smartWalletAddress,
+        createdAt: new Date().toISOString(),
+      },
+      sessionConfig
+    );
   });
 
   // Handle session deletions
@@ -147,242 +156,33 @@ export async function getWeb3Wallet(): Promise<IWeb3Wallet> {
   return web3wallet;
 }
 
-/**
- * Handle incoming DApp requests
- */
-/**
- * Build the Safe smart account for the given session — used by the
- * personal_sign / eth_sign / eth_signTypedData handlers so that signatures
- * verify against the SMART ACCOUNT address via EIP-1271, not the underlying
- * EOA. permissionless auto-wraps in ERC-6492 if the account isn't deployed.
- */
-async function getSmartAccountForSession(
-  config: SessionConfig,
-  authProof?: AuthProof
-) {
-  const chain = CHAINS[config.chainId as keyof typeof CHAINS];
-  if (!chain) throw new Error(`Unsupported chain: ${config.chainId}`);
-  const publicClient = createPublicClient({ chain, transport: http(config.rpcUrl) });
-
-  // Pick the signer based on what the session stored. In envelope mode
-  // the signer routes signMessage / signTypedData through the enclave
-  // via parent-proxy /sign — authProof (when supplied) is closed over so
-  // every signature produced by this signer carries it. For v3 wallets,
-  // authProof is mandatory and the enclave will reject if it's missing.
-  let owner;
-  if (config.ownerEncryptedKey && config.ownerAddress) {
-    const opts: any = {
-      envelopeBlob: config.ownerEncryptedKey,
-      ownerAddress: config.ownerAddress,
-    };
-    if (process.env.KMS_KEY_ARN) opts.kmsKeyArn = process.env.KMS_KEY_ARN;
-    if (authProof) opts.authProof = authProof;
-    owner = await makeSigner(opts);
-  } else if (config.ownerPrivateKey) {
-    owner = privateKeyToAccount(config.ownerPrivateKey as `0x${string}`);
-  } else {
-    throw new Error(
-      "session has neither ownerPrivateKey nor ownerEncryptedKey+ownerAddress"
-    );
-  }
-
-  return toSafeSmartAccount({ client: publicClient, owners: [owner], version: "1.4.1" });
-}
-
-async function handleSessionRequest(
-  method: string,
-  params: any[],
-  config: SessionConfig,
-  authProof?: AuthProof,
-  wcRequestId?: number
-): Promise<any> {
-  // Envelope-mode (v3) sessions require an authProof on every dApp
-  // request — the enclave's challenge binding will reject any signature
-  // it didn't see a fresh proof for.
-  const envelopeMode = !!config.ownerEncryptedKey;
-  if (envelopeMode && !authProof) {
-    throw new Error(
-      "v3 (envelope-mode) WalletConnect session requires authProof on every request approval. Pass `authProof: { kind: 'passkey' | 'oidc', ... }` to /api/walletconnect/requests/:id/approve."
-    );
-  }
-
-  switch (method) {
-    case "eth_sendTransaction": {
-      const tx = params[0];
-      console.log(`🔧 eth_sendTransaction:`, {
-        to: tx.to,
-        value: tx.value || "0",
-        dataLength: tx.data?.length || 0,
-      });
-
-      // v3 fast path: if the client hit /preview first there's a cached
-      // prepared UO for this exact request. Submitting it via the shared
-      // /submit-prepared handler guarantees the user_op_hash matches what
-      // the client signed (no rebuild, no drift). Legacy sessions fall
-      // through to submitUniversalTransaction below.
-      if (envelopeMode && authProof && wcRequestId !== undefined) {
-        const cached = wcTicketByRequestId.get(wcRequestId);
-        if (cached && cached.expiresAt > Date.now()) {
-          wcTicketByRequestId.delete(wcRequestId);
-          const { submitPreparedUniversalTransaction } = await import("./twoPhase");
-          const submit = await submitPreparedUniversalTransaction({
-            ticketId: cached.ticketId,
-            authProof,
-          });
-          if (!submit.success) {
-            throw new Error(submit.error || "Prepared UO submit failed");
-          }
-          return submit.userOperationHash || submit.transactionHash;
-        }
-      }
-
-      // Route through smart account
-      const calls = [{
-        to: tx.to,
-        value: tx.value || "0",
-        data: tx.data || undefined,
-      }];
-
-      // submitUniversalTransaction's signerOptions accepts both the
-      // envelope+ownerAddress+authProof bundle and the legacy plaintext
-      // key, so a single call covers both modes.
-      const signerOptions: any = envelopeMode
-        ? {
-            envelopeBlob: config.ownerEncryptedKey,
-            ownerAddress: config.ownerAddress,
-            authProof,
-            ...(process.env.KMS_KEY_ARN ? { kmsKeyArn: process.env.KMS_KEY_ARN } : {}),
-          }
-        : undefined;
-
-      const result = await submitUniversalTransaction(
-        config.chainId,
-        config.rpcUrl,
-        calls,
-        config.ownerPrivateKey ?? "",
-        config.bundlerUrl,
-        config.paymasterRPC,
-        undefined, // paymasterToken — sponsored
-        signerOptions
-      );
-
-      if (!result.success) {
-        throw new Error(result.error || "Transaction failed");
-      }
-
-      return result.userOperationHash || result.transactionHash;
-    }
-
-    case "personal_sign": {
-      // params: [message, address]
-      const message = params[0];
-      console.log(`✍️ personal_sign: ${message.slice(0, 100)}...`);
-      const smartAccount = await getSmartAccountForSession(config, authProof);
-      return await smartAccount.signMessage({
-        message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
-      });
-    }
-
-    case "eth_sign": {
-      // params: [address, message]
-      const message = params[1];
-      const smartAccount = await getSmartAccountForSession(config, authProof);
-      return await smartAccount.signMessage({
-        message: { raw: ethers.utils.arrayify(message) as `0x${string}` },
-      });
-    }
-
-    case "eth_signTypedData":
-    case "eth_signTypedData_v3":
-    case "eth_signTypedData_v4": {
-      // params: [address, typedData]
-      const typedData = typeof params[1] === "string" ? JSON.parse(params[1]) : params[1];
-      const { domain, types, message, primaryType } = typedData;
-
-      // Remove EIP712Domain from types — viem/permissionless handles it
-      const filteredTypes = { ...types };
-      delete filteredTypes.EIP712Domain;
-
-      const smartAccount = await getSmartAccountForSession(config, authProof);
-      return await smartAccount.signTypedData({
-        domain,
-        types: filteredTypes,
-        primaryType,
-        message,
-      });
-    }
-
-    case "eth_chainId": {
-      return `0x${config.chainId.toString(16)}`;
-    }
-
-    case "eth_accounts": {
-      return [config.smartWalletAddress];
-    }
-
-    case "wallet_switchEthereumChain": {
-      // DApp wants to switch chains — we acknowledge but don't change
-      // since the session is bound to a specific chain
-      return null;
-    }
-
-    default:
-      throw new Error(`Unsupported method: ${method}`);
-  }
+function queuePendingRequest(pending: PendingRequest, sessionConfig: SessionConfig): void {
+  pendingRequests.set(pending.id, { pending, sessionConfig });
+  console.log(`⏳ Request ${pending.id} queued for approval: ${pending.method} from ${pending.peerName}`);
+  emitEvent({ type: "pending_request", topic: pending.topic, data: pending });
 }
 
 /**
- * Pair with a DApp and create a session
+ * Pair with a DApp and create a session bound to `account` (an AccountRef).
  */
 export async function pairAndApprove(
   uri: string,
-  ownerKey: { ownerPrivateKey?: string; ownerEncryptedKey?: string; ownerAddress?: string },
-  chainId: number,
-  rpcUrl: string,
-  bundlerUrl: string,
-  paymasterRPC: string
+  accountRaw: unknown,
+  chainIdRaw: unknown,
+  rpcUrl?: string
 ): Promise<{
   topic: string;
   smartWalletAddress: string;
   peerName: string;
   peerUrl: string;
 }> {
+  const chainId = assertChain(chainIdRaw);
+  const ref = parseAccountRef(accountRaw);
+  // Validates the address and (for migrated Safes) that this chain is migrated.
+  await resolveAccount(getPublicClient(chainId, rpcUrl), chainId, ref);
+  const smartWalletAddress = ref.address;
+
   const wallet = await getWeb3Wallet();
-
-  // Compute smart wallet address
-  const chain = CHAINS[chainId as keyof typeof CHAINS];
-  if (!chain) throw new Error(`Unsupported chain ID: ${chainId}`);
-
-  const publicClient = createPublicClient({ transport: http(rpcUrl), chain });
-
-  // Pick the signer based on what the caller supplied. Safe address
-  // derivation only depends on the owner's *address*, so the no-key
-  // signer (envelope mode) is sufficient here even without authProof.
-  let signer: any;
-  let ownerAddress: string;
-  if (ownerKey.ownerEncryptedKey && ownerKey.ownerAddress) {
-    signer = await makeSigner({
-      envelopeBlob: ownerKey.ownerEncryptedKey,
-      kmsKeyArn: process.env.KMS_KEY_ARN || "unused-for-address-derivation",
-      ownerAddress: ownerKey.ownerAddress,
-    });
-    ownerAddress = ownerKey.ownerAddress;
-  } else if (ownerKey.ownerPrivateKey) {
-    signer = privateKeyToAccount(ownerKey.ownerPrivateKey as `0x${string}`);
-    ownerAddress = (signer as any).address;
-  } else {
-    throw new Error(
-      "pairAndApprove: provide either ownerPrivateKey, or ownerEncryptedKey + ownerAddress"
-    );
-  }
-
-  const smartAccount = await toSafeSmartAccount({
-    client: publicClient,
-    owners: [signer],
-    version: "1.4.1",
-  });
-  const smartWalletAddress = smartAccount.address;
-
   console.log(`🔗 Pairing with DApp. Smart wallet: ${smartWalletAddress}`);
 
   // Pair and wait for session proposal
@@ -397,8 +197,6 @@ export async function pairAndApprove(
     wallet.pair({ uri }).catch(reject);
   });
 
-  // Build approved namespaces from the proposal
-  // Support all EVM chains the DApp requests
   const chainString = `eip155:${chainId}`;
   const accounts = [`${chainString}:${smartWalletAddress}`];
 
@@ -424,27 +222,14 @@ export async function pairAndApprove(
     },
   });
 
-  // Approve the session
   const session = await wallet.approveSession({
     id: proposal.id,
     namespaces: approvedNamespaces,
   });
 
-  // Store session config — preserve whichever key shape the caller
-  // gave us so handleSessionRequest can pick the right signing path.
-  // Use exact-optional spread so we only set the fields that exist —
-  // exactOptionalPropertyTypes rejects `undefined` for `string?`.
-  const sessionEntry: SessionConfig = {
-    ownerAddress,
-    smartWalletAddress,
-    chainId,
-    rpcUrl,
-    bundlerUrl,
-    paymasterRPC,
-  };
-  if (ownerKey.ownerPrivateKey) sessionEntry.ownerPrivateKey = ownerKey.ownerPrivateKey;
-  if (ownerKey.ownerEncryptedKey) sessionEntry.ownerEncryptedKey = ownerKey.ownerEncryptedKey;
-  sessions.set(session.topic, sessionEntry);
+  const entry: SessionConfig = { account: serialiseAccountRef(ref), smartWalletAddress, chainId };
+  if (rpcUrl) entry.rpcUrl = rpcUrl;
+  sessions.set(session.topic, entry);
 
   const peerName = session.peer?.metadata?.name || "Unknown DApp";
   const peerUrl = session.peer?.metadata?.url || "";
@@ -504,317 +289,167 @@ export function getPendingRequests(): PendingRequest[] {
   return Array.from(pendingRequests.values()).map(({ pending }) => pending);
 }
 
-/**
- * Preview a pending WalletConnect request — computes the hash the
- * enclave will sign so a v3 (device-bound) session can bind an
- * authProof to that exact value before approve() actually signs.
- *
- * Returns:
- *   - `hashToSign`: hex — the passkey's clientDataJSON.challenge (or
- *     OIDC id_token.nonce) MUST equal this before /approve will succeed.
- *   - `method`: pass-through so the client can decide how to display
- *     the confirm screen ("Sign message" vs "Send transaction").
- *   - `peerName`, `smartWalletAddress`, `chainId`: contextual info.
- *
- * For eth_sendTransaction the hash is the ERC-4337 user_op_hash from a
- * fresh prepareUserOperation. That prepared op is stashed in the ticket
- * cache so /approve doesn't have to rebuild it — same pattern as
- * /api/transaction/preview.
- *
- * For personal_sign / eth_sign / eth_signTypedData_v4 the hash is the
- * Safe smart-account's SafeMessage typed-data digest (owner-side hash),
- * computed here so the enclave sees the same value the passkey signed.
- *
- * Legacy (local-mode) sessions don't need to call this — they can go
- * straight to approve() with no authProof. This endpoint is a no-op
- * for them.
- */
-export async function previewSessionRequest(requestId: number): Promise<{
-  success: boolean;
-  method?: string;
-  hashToSign?: string;
-  peerName?: string;
-  smartWalletAddress?: string;
-  chainId?: number;
+/** personal_sign params are hex; treat non-hex as UTF-8 text. */
+function toSignable(message: unknown): string | { raw: Hex } {
+  if (typeof message === "string" && isHex(message)) return { raw: message };
+  return String(message);
+}
+
+function parseTypedData(raw: unknown): Record<string, unknown> {
+  return (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown>;
+}
+
+export interface PreviewResult {
+  method: string;
+  peerName: string;
+  smartWalletAddress: string;
+  chainId: number;
+  requiresAuthProof: boolean;
+  hashToSign?: Hex;
   ticketId?: string;
   expiresAtMs?: number;
   ttlMs?: number;
-  requiresAuthProof: boolean;
-  error?: string;
-}> {
-  const entry = pendingRequests.get(requestId);
-  if (!entry) {
-    return { success: false, requiresAuthProof: false, error: `No pending request with id ${requestId}` };
-  }
-  const { pending, sessionConfig } = entry;
-  const envelopeMode = !!sessionConfig.ownerEncryptedKey;
-
-  try {
-    switch (pending.method) {
-      case "eth_sendTransaction": {
-        const tx = pending.params[0] as { to: string; value?: string; data?: string };
-        const calls = [
-          {
-            to: tx.to,
-            value: tx.value || "0",
-            data: tx.data || undefined,
-          },
-        ];
-        // Only build the userOp when the session is v3 — legacy sessions
-        // can just approve() directly with the plaintext key.
-        if (!envelopeMode) {
-          return {
-            success: true,
-            method: pending.method,
-            peerName: pending.peerName,
-            smartWalletAddress: pending.smartWalletAddress,
-            chainId: pending.chainId,
-            requiresAuthProof: false,
-          };
-        }
-
-        const { previewUniversalTransaction } = await import("./twoPhase");
-        const chainConfig = (await import("./abstraction")).CHAINS[
-          sessionConfig.chainId as keyof (typeof import("./abstraction"))["CHAINS"]
-        ];
-        if (!chainConfig) throw new Error(`Unsupported chain: ${sessionConfig.chainId}`);
-        const result = await previewUniversalTransaction({
-          chainId: sessionConfig.chainId,
-          rpcNodeProvider: sessionConfig.rpcUrl,
-          calls: calls.map((c) => {
-            const call: { to: string; value?: string; data?: string } = { to: c.to };
-            if (c.value !== undefined) call.value = c.value;
-            if (c.data !== undefined) call.data = c.data;
-            return call;
-          }),
-          ownerAddress: sessionConfig.ownerAddress,
-          ownerEncryptedKey: sessionConfig.ownerEncryptedKey!,
-          bundlerUrl: sessionConfig.bundlerUrl,
-          paymasterRPC: sessionConfig.paymasterRPC,
-        });
-        if (!result.success) {
-          return { success: false, requiresAuthProof: true, error: result.error };
-        }
-        // Cross-link the ticket back to the WC request so /approve knows
-        // which cached UO to use even without the client re-sending the
-        // ticket id.
-        wcTicketByRequestId.set(requestId, {
-          ticketId: result.ticketId,
-          expiresAt: result.expiresAt,
-        });
-        return {
-          success: true,
-          method: pending.method,
-          peerName: pending.peerName,
-          smartWalletAddress: pending.smartWalletAddress,
-          chainId: pending.chainId,
-          hashToSign: result.userOpHashHex,
-          ticketId: result.ticketId,
-          expiresAtMs: result.expiresAt,
-          ttlMs: result.ttlMs,
-          requiresAuthProof: true,
-        };
-      }
-
-      case "personal_sign":
-      case "eth_sign": {
-        const messageHex =
-          pending.method === "personal_sign" ? pending.params[0] : pending.params[1];
-        if (!envelopeMode) {
-          return {
-            success: true,
-            method: pending.method,
-            peerName: pending.peerName,
-            smartWalletAddress: pending.smartWalletAddress,
-            chainId: pending.chainId,
-            requiresAuthProof: false,
-          };
-        }
-        // Compute the exact hash the Safe owner will sign. viem's
-        // hashMessage does the EIP-191 wrap; Safe then wraps THAT in an
-        // EIP-712 SafeMessage before the owner signs — we do the same
-        // here so the returned hash is what the enclave will see.
-        const rawMessage = ethers.utils.arrayify(messageHex);
-        const eip191Hash = (await import("viem")).hashMessage({
-          raw: rawMessage as any,
-        });
-        const hashToSign = computeSafeMessageHash(
-          eip191Hash,
-          sessionConfig.smartWalletAddress,
-          sessionConfig.chainId
-        );
-        return {
-          success: true,
-          method: pending.method,
-          peerName: pending.peerName,
-          smartWalletAddress: pending.smartWalletAddress,
-          chainId: pending.chainId,
-          hashToSign,
-          requiresAuthProof: true,
-        };
-      }
-
-      case "eth_signTypedData":
-      case "eth_signTypedData_v3":
-      case "eth_signTypedData_v4": {
-        const typedData =
-          typeof pending.params[1] === "string"
-            ? JSON.parse(pending.params[1])
-            : pending.params[1];
-        if (!envelopeMode) {
-          return {
-            success: true,
-            method: pending.method,
-            peerName: pending.peerName,
-            smartWalletAddress: pending.smartWalletAddress,
-            chainId: pending.chainId,
-            requiresAuthProof: false,
-          };
-        }
-        const filteredTypes = { ...typedData.types };
-        delete filteredTypes.EIP712Domain;
-        const inner = (await import("viem")).hashTypedData({
-          domain: typedData.domain,
-          types: filteredTypes,
-          primaryType: typedData.primaryType,
-          message: typedData.message,
-        });
-        const hashToSign = computeSafeMessageHash(
-          inner,
-          sessionConfig.smartWalletAddress,
-          sessionConfig.chainId
-        );
-        return {
-          success: true,
-          method: pending.method,
-          peerName: pending.peerName,
-          smartWalletAddress: pending.smartWalletAddress,
-          chainId: pending.chainId,
-          hashToSign,
-          requiresAuthProof: true,
-        };
-      }
-
-      default:
-        // Chain / accounts / switch chain don't sign anything — just
-        // return so the client can approve() without an authProof.
-        return {
-          success: true,
-          method: pending.method,
-          peerName: pending.peerName,
-          smartWalletAddress: pending.smartWalletAddress,
-          chainId: pending.chainId,
-          requiresAuthProof: false,
-        };
-    }
-  } catch (e: any) {
-    console.error(`❌ Preview WC request ${requestId} failed:`, e);
-    return { success: false, requiresAuthProof: envelopeMode, error: e?.message || String(e) };
-  }
 }
 
-// Ticket id (from twoPhase preview) for pending WC eth_sendTransaction
-// requests. Populated by previewSessionRequest(), consumed by
-// approveRequest() to skip rebuilding the userOp. Cleared on approve /
-// reject / preview-expiry.
-const wcTicketByRequestId = new Map<number, { ticketId: string; expiresAt: number }>();
-
 /**
- * Compute the Safe smart-account's SafeMessage EIP-712 digest — this is
- * the hash the owner (our enclave signer) actually signs. Wraps whatever
- * inner hash the caller provides (EIP-191 for personal_sign, EIP-712 for
- * signTypedData).
- *
- * Safe 1.4.1 SafeMessage type:
- *   SafeMessage(bytes message)
- *   domain: {chainId, verifyingContract: safeAddress}  (no name/version in 1.4.1)
+ * Preview a pending request: builds the UserOp / message ticket and returns
+ * the hash the passkey must sign. Non-signing methods need no proof.
  */
-function computeSafeMessageHash(
-  innerHash: string,
-  safeAddress: string,
-  chainId: number
-): string {
-  const { hashTypedData } = require("viem");
-  return hashTypedData({
-    domain: {
-      chainId,
-      verifyingContract: safeAddress as `0x${string}`,
-    },
-    types: {
-      SafeMessage: [{ name: "message", type: "bytes" }],
-    },
-    primaryType: "SafeMessage",
-    message: {
-      message: innerHash as `0x${string}`,
-    },
-  });
+export async function previewSessionRequest(requestId: number): Promise<PreviewResult> {
+  const entry = pendingRequests.get(requestId);
+  if (!entry) throw new PasskeyError("TICKET_NOT_FOUND", `No pending request with id ${requestId}`);
+  const { pending, sessionConfig } = entry;
+  const base = {
+    method: pending.method,
+    peerName: pending.peerName,
+    smartWalletAddress: pending.smartWalletAddress,
+    chainId: pending.chainId,
+  };
+  const common = {
+    chainId: sessionConfig.chainId,
+    account: sessionConfig.account,
+    ...(sessionConfig.rpcUrl ? { rpcUrl: sessionConfig.rpcUrl } : {}),
+  };
+
+  let ticket: { ticketId: string; hashToSign: Hex; expiresAt: number };
+  let kind: "userop" | "message";
+  switch (pending.method) {
+    case "eth_sendTransaction": {
+      const tx = pending.params[0] as { to: string; value?: string; data?: string };
+      ticket = await prepareOperation({
+        ...common,
+        calls: [{ to: tx.to, value: tx.value || "0", data: tx.data || "0x" }],
+        gas: { mode: "sponsored" },
+        purpose: "walletconnect",
+      });
+      kind = "userop";
+      break;
+    }
+    case "personal_sign":
+    case "eth_sign": {
+      const message = pending.method === "personal_sign" ? pending.params[0] : pending.params[1];
+      ticket = await prepareMessage({ ...common, kind: "personal_sign", message: toSignable(message) });
+      kind = "message";
+      break;
+    }
+    case "eth_signTypedData":
+    case "eth_signTypedData_v3":
+    case "eth_signTypedData_v4": {
+      ticket = await prepareMessage({ ...common, kind: "typed_data", typedData: parseTypedData(pending.params[1]) });
+      kind = "message";
+      break;
+    }
+    default:
+      return { ...base, requiresAuthProof: false };
+  }
+
+  wcTicketByRequestId.set(requestId, { ticketId: ticket.ticketId, kind, expiresAt: ticket.expiresAt });
+  return {
+    ...base,
+    requiresAuthProof: true,
+    hashToSign: ticket.hashToSign,
+    ticketId: ticket.ticketId,
+    expiresAtMs: ticket.expiresAt,
+    ttlMs: Math.max(0, ticket.expiresAt - Date.now()),
+  };
 }
 
+// Errors that mean "the user's approval didn't check out" — the dApp
+// request stays pending so the user can preview / sign again.
+const RETRYABLE = new Set([
+  "PASSKEY_REQUIRED",
+  "INVALID_PASSKEY_SIGNATURE",
+  "SIGNER_NOT_OWNER",
+  "TICKET_NOT_FOUND",
+  "VALIDATION_ERROR",
+]);
+
 /**
- * Approve a pending request — executes it and responds to the DApp.
- *
- * For v3 (envelope-mode) sessions, `authProof` is REQUIRED. Each
- * dApp signing request is its own user-consent gesture, so authProof
- * is passed in per-call (not stored on the session). The enclave will
- * reject any signature whose challenge/nonce doesn't match the
- * request's hash, so the proof must be bound to THIS specific
- * request's hash (the smart-wallet computes it during prepareUserOp
- * for sendTransaction; for personal_sign it's the EIP-191 digest;
- * for eth_signTypedData it's the EIP-712 digest).
- *
- * Legacy (local-mode) sessions don't need authProof — the plaintext
- * key in sessionConfig signs locally.
+ * Approve a pending request with the user's passkey proof. Signing methods
+ * need a prior preview (ticket) plus `{ authProof, signer }`.
  */
 export async function approveRequest(
   requestId: number,
-  authProof?: AuthProof
-): Promise<{
-  success: boolean;
-  result?: any;
-  error?: string;
-}> {
+  approval: { authProof?: unknown; signer?: unknown } = {}
+): Promise<{ success: true; result: any }> {
   const entry = pendingRequests.get(requestId);
-  if (!entry) {
-    return { success: false, error: `No pending request with id ${requestId}` };
-  }
-
+  if (!entry) throw new PasskeyError("TICKET_NOT_FOUND", `No pending request with id ${requestId}`);
   const { pending, sessionConfig } = entry;
   const wallet = await getWeb3Wallet();
 
-  try {
-    const result = await handleSessionRequest(
-      pending.method,
-      pending.params,
-      sessionConfig,
-      authProof,
-      requestId
-    );
-    await wallet.respondSessionRequest({
-      topic: pending.topic,
-      response: {
-        id: pending.id,
-        jsonrpc: "2.0",
-        result,
-      },
-    });
-    pendingRequests.delete(requestId);
-    emitEvent({ type: "request_approved", topic: pending.topic, data: { method: pending.method, result } });
-    console.log(`✅ Request ${requestId} approved and executed: ${pending.method}`);
-    return { success: true, result };
-  } catch (error: any) {
-    await wallet.respondSessionRequest({
-      topic: pending.topic,
-      response: {
-        id: pending.id,
-        jsonrpc: "2.0",
-        error: { code: -32000, message: error.message },
-      },
-    });
-    pendingRequests.delete(requestId);
-    emitEvent({ type: "request_failed", topic: pending.topic, data: { method: pending.method, error: error.message } });
-    console.error(`❌ Request ${requestId} approved but failed: ${error.message}`);
-    return { success: false, error: error.message };
+  let result: any;
+  if (SIGNING_METHODS.has(pending.method)) {
+    if (!approval.authProof) throw new PasskeyError("PASSKEY_REQUIRED", "approve requires authProof (kind: passkey)");
+    const ticket = wcTicketByRequestId.get(requestId);
+    if (!ticket || ticket.expiresAt <= Date.now()) {
+      throw new PasskeyError("TICKET_NOT_FOUND", "call /preview first (or again — the ticket expired)");
+    }
+    try {
+      if (ticket.kind === "userop") {
+        const r = await submitOperation({ ticketId: ticket.ticketId, signer: approval.signer, authProof: approval.authProof });
+        if (!r.success) throw new PasskeyError("SUBMIT_FAILED", `UserOp ${r.userOpHash} reverted on chain`);
+        // dApps poll eth_getTransactionReceipt, so prefer the tx hash.
+        result = r.transactionHash ?? r.userOpHash;
+      } else {
+        result = (await submitMessage({ ticketId: ticket.ticketId, signer: approval.signer, authProof: approval.authProof })).signature;
+      }
+    } catch (error: any) {
+      if (error instanceof PasskeyError && RETRYABLE.has(error.code)) throw error;
+      await wallet.respondSessionRequest({
+        topic: pending.topic,
+        response: { id: pending.id, jsonrpc: "2.0", error: { code: -32000, message: error?.message ?? "failed" } },
+      });
+      pendingRequests.delete(requestId);
+      wcTicketByRequestId.delete(requestId);
+      emitEvent({ type: "request_failed", topic: pending.topic, data: { method: pending.method, error: error?.message } });
+      throw error;
+    }
+  } else {
+    switch (pending.method) {
+      case "eth_chainId":
+        result = `0x${sessionConfig.chainId.toString(16)}`;
+        break;
+      case "eth_accounts":
+        result = [sessionConfig.smartWalletAddress];
+        break;
+      case "wallet_switchEthereumChain":
+        // Session is bound to one chain; acknowledge without switching.
+        result = null;
+        break;
+      default:
+        throw new PasskeyError("VALIDATION_ERROR", `Unsupported method: ${pending.method}`);
+    }
   }
+
+  await wallet.respondSessionRequest({
+    topic: pending.topic,
+    response: { id: pending.id, jsonrpc: "2.0", result },
+  });
+  pendingRequests.delete(requestId);
+  wcTicketByRequestId.delete(requestId);
+  emitEvent({ type: "request_approved", topic: pending.topic, data: { method: pending.method } });
+  console.log(`✅ Request ${requestId} approved: ${pending.method}`);
+  return { success: true, result };
 }
 
 /**
@@ -842,4 +477,25 @@ export async function rejectRequest(requestId: number): Promise<void> {
   wcTicketByRequestId.delete(requestId);
   emitEvent({ type: "request_rejected", topic: pending.topic, data: { method: pending.method } });
   console.log(`❌ Request ${requestId} rejected by user: ${pending.method}`);
+}
+
+// ─── Test hooks (WalletKit needs a relay; tests inject a fake) ───────
+
+export function __setWeb3WalletForTests(wallet: IWeb3Wallet | null): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("test hook");
+  web3wallet = wallet;
+}
+
+export function __queueRequestForTests(
+  pending: Omit<PendingRequest, "createdAt" | "smartWalletAddress" | "chainId">,
+  session: { account: unknown; chainId: number; rpcUrl?: string }
+): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("test hook");
+  const ref = parseAccountRef(session.account);
+  const cfg: SessionConfig = { account: serialiseAccountRef(ref), smartWalletAddress: ref.address, chainId: session.chainId };
+  if (session.rpcUrl) cfg.rpcUrl = session.rpcUrl;
+  queuePendingRequest(
+    { ...pending, chainId: session.chainId, smartWalletAddress: ref.address, createdAt: new Date().toISOString() },
+    cfg
+  );
 }

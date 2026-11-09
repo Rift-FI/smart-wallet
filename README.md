@@ -1,408 +1,248 @@
 # Smart Wallets Server
 
-The ERC-4337 service that Rift's backend talks to whenever it needs
-to send a UserOperation. Wraps Pimlico bundlers, builds Safe Account
-Abstraction transactions, and either signs them locally (legacy
-mode) or hands the userOpHash off to a Nitro Enclave for signing
-(Phase 2 enclave mode). Same API contract for callers either way.
+The ERC-4337 service Rift's backend talks to whenever a user's Safe needs
+to do something on chain. It builds Safe v1.4.1 UserOperations (EntryPoint
+v0.7, Safe4337Module), routes gas through Pimlico (or Rift's own Celo
+paymaster), and submits them.
 
-Stack: TypeScript, Express, viem, permissionless SDK, Pimlico v2
-bundlers, the Safe singleton at version 1.4.1, and an EVM-side
-ERC-20 paymaster.
+**It holds no key that can move user funds.** Every Safe is owned only by
+the user's passkeys (WebAuthn P-256). The passkey signs on the user's
+device; the Safe verifies the signature on chain. This service only
+builds the operation, encodes the signature the client sends back, checks
+it, and relays it.
 
-## What it does
+Stack: TypeScript, Express, viem 2.37, permissionless 0.2.57, Pimlico,
+Safe passkey module v0.2.1.
 
-Takes a request shape that looks like "send N tokens from owner X
-on chain Y to address Z" and turns it into a signed and bundled
-ERC-4337 UserOperation that the recipient receives a couple of
-seconds later. Gas is paid in the same token being transferred, via
-the paymaster, so end users do not need ETH.
+## Model
 
-Two signing modes, picked at runtime by the SIGNING_MODE env var:
+- **Passkey-native Safe** (new users). Owner = `SafeWebAuthnSharedSigner`
+  configured with the user's first passkey. Counterfactual address, same
+  on every chain, deployed by the first UserOp on each chain. The deploy
+  op also adds every other active passkey (`createSigner` +
+  `addOwnerWithThreshold`).
+- **Extra passkeys** are `SafeWebAuthnSignerProxy` owners
+  (`factory.getSigner(x, y, VERIFIERS)`), added / removed by UserOps signed
+  by an existing passkey.
+- **Migrated Safe** (existing users, same address). Old owner was an EOA;
+  `/api/v3/migrate` swaps it for passkey proxies in one UserOp. That op
+  is the ONLY thing the old EOA key is ever used to sign, and the calldata
+  is checked against an allowlist before signing (`passkey/migration.ts`).
+- `VERIFIERS = (0x0100 << 160) | FCL_P256_VERIFIER` everywhere: RIP-7212
+  precompile with the FCL verifier as fallback (also for the shared
+  signer's configuration).
 
-- Local mode (default). The owner's plaintext private key, either
-  sent directly as ownerPrivateKey or recovered in process from an
-  envelope blob, is held in JavaScript memory long enough to sign
-  the userOpHash. Used in production today (smartwallet.riftfi.xyz).
-- Enclave mode. The owner's plaintext key is never recovered here at
-  all. The smart-wallet builds the userOpHash, then posts it to the
-  parent-proxy /sign endpoint running on the EC2 alongside the Nitro
-  Enclave. The enclave does the secp256k1 signing inside the TEE.
-  Used in sandbox today (smart-wallet-tee Railway service) and
-  scheduled for production cutover.
+Per-chain capability table (`src/passkey/constants.ts`, `GET /api/passkey/capabilities`):
 
-Both modes are wire-compatible. The caller (backend, integrating
-partners) sends the same body shape regardless of which signing
-mode is on. The dual implementation lives behind the makeSigner
-factory in src/signerFactory.ts.
+| Chain | shared signer | signer factory |
+|---|---|---|
+| 1, 8453, 137, 42220, 42161, 43114, 56 | yes | yes |
+| 80094 Berachain | yes | no (no extra passkeys / migration yet) |
+
+Missing contracts fail with `PASSKEY_UNSUPPORTED_ON_CHAIN`. Deployment
+notes: `scripts/deploy-passkey-contracts.md`.
+
+## Two-phase signing
+
+```
+backend                         smart-wallet                     user device
+  │ POST /api/v3/prepare          │                                  │
+  │ ───────────────────────────►  │ build UserOp (gas, paymaster)    │
+  │ ◄─ { ticketId, hashToSign }   │ hashToSign = SafeOp EIP-712 hash │
+  │ ─────────────────────────────────────────────────────────────►   │
+  │                               │      navigator.credentials.get   │
+  │ ◄──────────────────────────────────── authProof (challenge =     │
+  │ POST /api/v3/submit           │       the 32 hash bytes)         │
+  │ ───────────────────────────►  │ encode Safe contract signature,  │
+  │                               │ Safe.checkSignatures (eth_call), │
+  │                               │ submit to bundler, wait receipt  │
+  │ ◄─ { userOpHash, transactionHash, success }                      │
+```
+
+Tickets are single-use, in-memory, `TICKET_TTL_MS` (default 120 s). A bad
+signature does not burn the ticket; a submitted one does.
+
+Signature placed in the UserOp (§1d):
+`encodePacked(uint48 0, uint48 0, contractSignature)` with
+`contractSignature = {r = signer}{s = 65}{v = 0}{len}{abi.encode(bytes authenticatorData, string clientDataFields, uint256[2] [r, s])}`.
+`signer` is the shared signer for a native Safe's first passkey, the
+proxy address otherwise. `passkey/webauthn.ts` builds it from the
+`authProof` alone (no WebAuthn `getFn` server-side); a unit test checks it
+is byte-identical to permissionless's own signing.
 
 ## API
 
-### POST /api/transfer
+All routes except `GET /health` require
+`Authorization: Bearer $INTERNAL_SERVICE_TOKEN` (503 if the env is unset,
+401 if wrong).
 
-Transfer any ERC-20 token on any supported chain with gas paid in
-the same token.
+Success bodies put the payload at the top level **and** under `data`:
+`{ success: true, address, data: { address }, timestamp }`. Errors:
+`{ success: false, error: "<CODE>", message, details? }`.
 
-```json
-{
-  "chainId": 8453,
-  "tokenAddress": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-  "recipient": "0x...",
-  "amount": 3,
-  "ownerEncryptedKey": "enc:v1:AQIDAH...:0a1b2c...:8f9e0d...",
-  "ownerAddress": "0x...",
-  "rpcUrl": "https://base-mainnet.g.alchemy.com/v2/<key>"
-}
+Types used below:
+
+```ts
+AccountRef =
+  | { kind: "passkey_native", address, firstPasskey: { x, y, credentialId }, extraPasskeys: [{ x, y }] }
+  | { kind: "migrated", address, legacyOwner }        // legacyOwner = old EOA address
+// x, y: 0x-hex (32 bytes) or decimal strings
+
+authProof = { kind: "passkey", cred_id_b64, client_data_json_b64,
+              authenticator_data_b64, signature_b64 }  // standard base64, DER sig
+signer    = { address, kind: "shared" | "proxy" }
+
+gas = { mode: "sponsored", ...markup? } | { mode: "token", token, ...markup? }
+markup fields (flat on `gas` or under `gas.markup`):
+  markupBps, projectMarkupBps, projectTreasuryAddress,
+  transferTokenAddress, transferBaseAmountWei, flatMarkupTokenAddress
 ```
 
-The caller has two equivalent options for key material:
+| Route | Body | Returns |
+|---|---|---|
+| `POST /api/passkey/address` | `{ credential: { x, y } }` | `{ address }` native Safe |
+| `POST /api/passkey/signer` | `{ x, y }` | `{ proxyAddress }` |
+| `GET /api/passkey/capabilities` | | `{ chains: { [id]: { sharedSigner, signerFactory } } }` |
+| `POST /api/v3/prepare` | `{ chainId, account, calls[], gas, purpose, intent?, rpcUrl? }` | `{ ticketId, hashToSign, userOp, expiresAt, chainId, sender, deployed }` |
+| `POST /api/v3/submit` | `{ ticketId, signer, authProof }` | `{ userOpHash, transactionHash, success, status }` |
+| `POST /api/v3/message/prepare` | `{ chainId, account, kind: "personal_sign" \| "typed_data", message \| typedData }` | `{ ticketId, hashToSign, expiresAt, deployed }` |
+| `POST /api/v3/message/submit` | `{ ticketId, signer, authProof }` | `{ signature, erc6492, messageHash }` |
+| `POST /api/v3/migrate` | `{ chainId, account: migrated ref, eoaPrivateKey, passkeys: [{ x, y }] }` | `{ status: "migrated" \| "already_migrated" \| "pending", owners, userOpHash, transactionHash, success }` |
+| `POST /api/v3/owners` | `{ chainId, safe }` | `{ deployed, owners, threshold }` |
 
-- ownerEncryptedKey (preferred). The KMS envelope blob from the
-  backend's encrypted_keys table. The smart-wallet decrypts in
-  process via KMS in local mode, or forwards to the enclave in
-  enclave mode. ownerAddress must be the EVM address of the owner
-  EOA, sent alongside.
-- ownerPrivateKey (legacy). The plaintext hex private key. Still
-  supported for backwards compatibility with older backend
-  deploys. Only works in local mode.
+Notes:
 
-Validation:
+- `calls[]`: `{ to, value?, data? }` or `{ to, value?, abi, functionName, args }`.
+- `intent` (optional convenience, may replace `calls`):
+  `{ type: "add_passkey", passkey: { x, y } }` builds
+  `[createSigner, addOwnerWithThreshold(proxy, 1)]`;
+  `{ type: "remove_passkey", passkey | owner }` builds
+  `removeOwner(prev, owner, 1)` and refuses the last owner (`409 LAST_OWNER`).
+- `message` follows viem semantics: a string is UTF-8, `{ raw: "0x…" }` is
+  bytes. Deployed Safe → ERC-1271 contract signature (checked with
+  `isValidSignature`). Undeployed native Safe → ERC-6492-wrapped (checked
+  with viem `verifyHash`). Only the first passkey (shared signer) can sign
+  for an undeployed Safe.
+- A migrated ref on a chain that isn't migrated yet → `409 MIGRATION_REQUIRED`.
+- Migration gas: Pimlico sponsorship where available, else the Safe's own
+  native balance, else `409 MIGRATION_NEEDS_GAS`. The request body is
+  never logged and the key is never stored.
+- Markup is unchanged from the old one-phase routes: in token mode a single
+  ERC-20 transfer of the gas token gets Rift % + project % on its amount;
+  any other token-mode op gets the flat fee; sponsored mode only charges
+  what `transferBaseAmountWei` / `flatMarkupTokenAddress` ask for. Calls
+  are ordered `[paymaster approve(s), user calls, markup transfers]`.
 
-- chainId, tokenAddress, recipient, amount, rpcUrl always required.
-- In local mode, ownerPrivateKey is required. The service verifies
-  it derives to the same address as ownerAddress before continuing.
-- In enclave mode, ownerEncryptedKey and ownerAddress are required.
-  No private-key derivation is possible, so ownerAddress is taken
-  on trust. If the enclave eventually produces a signature
-  recoverable to that address, the UserOp succeeds. Otherwise it
-  fails at the bundler with a signature-verification error.
+Error codes: `VALIDATION_ERROR`, `UNSUPPORTED_CHAIN`,
+`PASSKEY_UNSUPPORTED_ON_CHAIN`, `PASSKEY_REQUIRED` (missing or `kind:
+"oidc"` proof), `INVALID_PASSKEY_SIGNATURE`, `SIGNER_NOT_OWNER`,
+`ACCOUNT_MISMATCH`, `TICKET_NOT_FOUND` (404), `MIGRATION_REQUIRED`,
+`MIGRATION_NEEDS_GAS`, `MIGRATION_CALLDATA_REJECTED`, `EOA_MISMATCH`,
+`LAST_OWNER`, `NOT_AN_OWNER`, `CONFIGURATION_ERROR` (500),
+`PREPARE_FAILED`, `SUBMIT_FAILED`.
 
-Response:
+### Kept route names
 
-```json
-{
-  "success": true,
-  "data": {
-    "userOperationHash": "0x...",
-    "chainId": 8453
-  },
-  "message": "Transfer completed successfully on chain 8453",
-  "timestamp": "2026-06-25T13:46:58.490Z"
-}
-```
+- `POST /api/transaction/preview` `{ chainId, account, calls, gas? | paymasterToken? + markup fields }`
+  and `POST /api/bridge/preview` `{ sourceChainId, destChainId, tokenAddress, amount, account, recipient? }`
+  return the v3 prepare payload plus the old fields (`user_op_hash_hex`,
+  `ticket_id`, `expires_at_ms`, `ttl_ms`, `smart_account_address`, `chain_id`).
+- `POST /api/transaction/submit-prepared` `{ ticketId, authProof, signer? }`
+  (`signer` defaults to the shared signer for a native Safe).
+- `POST /api/estimate-fee`, `POST /api/bridge-quote`: read-only, take
+  `account` (or a legacy `ownerAddress`).
+- `POST /api/smart-account/address|create` `{ chainId, ownerAddress }`:
+  legacy EOA-owned Safe address (the private-key fallback is gone).
+- `/api/v2/*`: client-EOA relay (the client personal_signs), unchanged.
+- WalletConnect (sessions held server-side):
+  `POST /api/walletconnect/pair { uri, chainId, account }`,
+  `GET /api/walletconnect/sessions`, `DELETE /api/walletconnect/sessions/:topic`,
+  `GET /api/walletconnect/requests`,
+  `POST /api/walletconnect/requests/:id/preview` → `{ hash_to_sign, ticket_id, requires_auth_proof }`
+  (SafeOp hash for `eth_sendTransaction`, SafeMessage hash for the sign methods),
+  `POST /api/walletconnect/requests/:id/approve { authProof, signer }` → submits and
+  answers the dApp (tx hash, or the ERC-1271 / ERC-6492 signature),
+  `POST /api/walletconnect/requests/:id/reject`. An invalid proof leaves the
+  request pending.
+- Removed: `POST /api/transfer`, `/api/transaction`, `/api/bridge` →
+  `410 REPLACED_BY_PASSKEY_WALLETS`; `POST /api/sign` → `410 EOA_SIGNING_REMOVED`.
+- `GET /api/system/status`, `GET /health`.
 
-### POST /api/transaction
+## Gas
 
-Same dispatch as /api/transfer, but accepts an array of arbitrary
-calls (to, data, value, or to, abi, functionName, args). Useful for
-contract interactions other than plain ERC-20 transfers. Same
-key-material handling.
+Per chain, `<PREFIX>_BUNDLER_URL` and `<PREFIX>_PAYMASTER_RPC` (Pimlico)
+and `<PREFIX>_RPC_URL` (node; public fallback). Prefixes: `ETHEREUM`,
+`BASE`, `POLYGON`, `CELO`, `ARBITRUM`, `AVALANCHE`, `BSC`, `BERACHAIN`.
 
-### POST /api/bridge
-
-Wraps Across Protocol for crosschain USDC and USDT. Builds the
-deposit on the source chain, signs the UserOp, sends, and returns
-the bundle hash. The recipient on the destination chain defaults to
-the sender's own Safe smart-account address since Safe addresses are
-canonical across EVM chains.
-
-### POST /api/smart-account/address
-
-Computes the deterministic Safe smart-account address for a given
-EOA. Pure derivation, no chain side-effects. Accepts ownerAddress
-directly (preferred); falls back to ownerPrivateKey to derive the
-address from for backwards compatibility.
-
-The returned address is valid on every EVM chain Rift supports. The
-Safe singleton and Proxy Factory are deployed at canonical addresses
-on every supported chain, so CREATE2 with the same salt produces
-the same address everywhere.
-
-### POST /api/sign
-
-Direct signing primitive. Forwards a precomputed 32-byte digest to
-the enclave's /sign endpoint. Used by direct callers who have built
-their own UserOp and just need a signature. Only valid in enclave
-mode.
-
-### POST /api/walletconnect/pair, /approve, /reject, /requests
-
-Holds a WalletConnect v2 session inside this process so the SDK
-client does not have to. Pairs a URI to a smart-account, holds the
-session, and routes approvals back through the same Safe signing
-path as everything else.
-
-### GET /health
-
-Returns plain "ok". Used by Railway's healthcheck.
-
-## Signing-mode internals
-
-### Local mode
-
-The body either has ownerPrivateKey (used as-is) or ownerEncryptedKey
-(decrypted by middleware/resolveOwnerKey.ts via the KMS client in
-src/keyEncryption.ts before the route handler runs). Either way,
-ownerPrivateKey is populated on req.body by the time the route
-handler runs.
-
-makeSigner builds a viem account with privateKeyToAccount and that
-gets passed to toSafeSmartAccount. The Safe builds and signs the
-UserOp in process.
-
-This is what production smartwallet.riftfi.xyz runs today. The
-plaintext lives in JS memory for the lifetime of one signing call.
-
-### Enclave mode (SIGNING_MODE=enclave)
-
-middleware/resolveOwnerKey.ts is short-circuited: when in enclave
-mode, it does not decrypt the envelope. It leaves the envelope on
-req.body and stamps ownerAddress so route handlers know which
-address the eventual signature will be valid for.
-
-makeSigner builds a viem account using viem's toAccount() with a
-custom signMessage that posts the message hash to the parent-proxy
-/sign endpoint over HTTPS. The Bearer token is read from
-PARENT_PROXY_AUTH_TOKEN. The parent-proxy authenticates,
-forwards to the enclave over vsock, and returns the 65-byte
-signature.
-
-toSafeSmartAccount sees a normal viem account, calls .signMessage()
-on it when building the UserOp, and never knows the signing
-happened in a TEE.
-
-The flow:
-
-```
-caller
-  |
-  POST /api/transfer (body has envelope + ownerAddress)
-  v
-smart-wallet (Railway)
-  |
-  build UserOp, compute userOpHash
-  |
-  POST /sign (body has envelope + userOpHash + kms_key_arn)
-  v
-parent-proxy (EC2)
-  |
-  vsock to enclave (port 5005)
-  v
-enclave
-  |
-  NSM attest, KMS Decrypt with Recipient, AES-decrypt envelope,
-  secp256k1 sign userOpHash, zeroize
-  |
-  vsock reply with 65-byte signature
-  v
-parent-proxy
-  |
-  HTTPS reply with signature_hex
-  v
-smart-wallet
-  |
-  attach signature, send UserOp to Pimlico bundler, paymaster
-  pays gas
-  |
-  HTTPS reply with userOperationHash
-  v
-caller
-```
-
-The plaintext EOA private key never enters the smart-wallet process
-in enclave mode. It only ever exists inside the enclave's RAM,
-released by KMS after PCR0 attestation, for the duration of one
-ECDSA signing operation.
+- `sponsored`: Pimlico verifying paymaster.
+- `token`: Pimlico ERC-20 paymaster (`getTokenQuotes`, Tether-safe approve,
+  `paymasterContext.token`). On Celo, Rift's own Erc20Paymaster
+  (`celo-paymaster.ts`, see `CELO_PAYMASTER.md`; its signer signs
+  paymaster data, never funds).
 
 ## Setup
 
 ```sh
 npm install
-cp env.example .env
-```
-
-Edit .env. Required:
-
-```
-PIMLICO_API_KEY=<your Pimlico key>
-
-# Per-chain bundler URLs (Pimlico)
-ETHEREUM_BUNDLER_URL=https://api.pimlico.io/v1/ethereum/rpc?apikey=<key>
-ETHEREUM_PAYMASTER_RPC=https://api.pimlico.io/v2/ethereum/rpc?apikey=<key>
-BASE_BUNDLER_URL=https://api.pimlico.io/v1/base/rpc?apikey=<key>
-BASE_PAYMASTER_RPC=https://api.pimlico.io/v2/base/rpc?apikey=<key>
-POLYGON_BUNDLER_URL=https://api.pimlico.io/v1/polygon/rpc?apikey=<key>
-POLYGON_PAYMASTER_RPC=https://api.pimlico.io/v2/polygon/rpc?apikey=<key>
-CELO_BUNDLER_URL=https://api.pimlico.io/v1/celo/rpc?apikey=<key>
-CELO_PAYMASTER_ADDRESS=<deployed Celo paymaster address>
-CELO_PAYMASTER_SIGNER_KEY=<celo paymaster signer key>
-CELO_PAYMASTER_OWNER_KEY=<celo paymaster owner key>
-
-NODE_ENV=development
-PORT=3000
-```
-
-For local mode KMS envelope handling:
-
-```
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=us-east-1
-KMS_KEY_ARN=arn:aws:kms:us-east-1:<account>:key/<key-id>
-ENCRYPTION_KEY=...   # only needed if any caller still sends legacy AES blobs
-```
-
-For enclave mode:
-
-```
-SIGNING_MODE=enclave
-PARENT_PROXY_URL=https://<EC2 nginx host>
-PARENT_PROXY_AUTH_TOKEN=<32-byte hex secret>
-KMS_KEY_ARN=arn:aws:kms:us-east-1:<account>:key/<key-id>
-```
-
-KMS_KEY_ARN is the CMK whose policy has the PCR0 attestation
-condition. The smart-wallet passes it through to the parent-proxy
-which passes it through to KMS.
-
-Then:
-
-```sh
+cp .env.example .env      # INTERNAL_SERVICE_TOKEN, Pimlico URLs, markup treasury
 npm run dev
 ```
 
-## Supported chains
+## Tests
 
-ERC-4337 with Pimlico bundlers and paymasters: Ethereum, Base,
-Polygon, Arbitrum, Optimism, Avalanche, BSC, Lisk.
+```sh
+npm test                       # unit + route tests; fork suites skip if anvil is down
+~/.foundry/bin/anvil --fork-url https://mainnet.base.org --port 8546 --silent &
+ANVIL_RPC_URL=http://127.0.0.1:8546 npm test   # also runs the Base-fork integration suites
+```
 
-Celo runs the same flow but uses Rift's own verifying paymaster
-contract instead of Pimlico's ERC-20 paymaster, because Pimlico does
-not yet cover Celo with ERC-20 gas. See CELO_PAYMASTER.md for the
-contract layout, the off-chain price-feed loop that signs
-pricePerNative into the paymasterAndData blob per UserOp, and the
-ops loop.
-
-For adding a new chain:
-
-1. Add the chain to src/chains.ts with chainId, rpcUrl, bundlerUrl,
-   paymasterRpc.
-2. Add the chain's bundler and paymaster env vars to .env.
-3. Update routes.ts if the chain needs any special handling.
+The fork suites (`src/passkey/fork.integration.test.ts`,
+`src/routes.integration.test.ts`) use a software P-256 virtual passkey
+(`src/testing/virtualPasskey.ts`) that produces real WebAuthn assertions,
+and `RELAY_MODE=direct` (honoured only when `NODE_ENV=test`), which fills
+gas itself and submits through `EntryPoint.handleOps` from an anvil
+account instead of a bundler. Pimlico can't run on a fork, so paymaster /
+markup call construction is unit-tested in `src/passkey/gas.test.ts`.
 
 ## Project layout
 
 ```
 src/
-  server.ts            Express bootstrap
-  routes.ts            Endpoint definitions and validation
-  abstraction.ts       Safe smart-account + Pimlico flow per chain
-  signerFactory.ts     makeSigner; picks enclave or local based on env
-  signingMode.ts       enclave-side helpers (signWithEnclave, parseEnvelope)
-  middleware/
-    resolveOwnerKey.ts unwraps envelope to plaintext in local mode;
-                       leaves envelope on body in enclave mode
-  keyEncryption.ts     KMS Decrypt + legacy AES fallback
-  kms.ts               AWS KMS client wrapper
-  relay.ts             Direct relay path for client-signed UserOps
-  celo-paymaster.ts    Off-chain pricePerNative signer for Celo
-  utils.ts             Rate limit + circuit breaker
-contracts/
-  src/
-    Erc20Paymaster.sol      Verifying paymaster (ERC-4337 v0.7)
-  script/
-    DeployErc20Paymaster.s.sol
+  server.ts              listen + shutdown
+  app.ts                 Express app (helmet, cors, auth, routes)
+  auth.ts                INTERNAL_SERVICE_TOKEN bearer check
+  routes.ts              HTTP routes (passkey API, kept route names, WalletConnect)
+  routesV2.ts            /api/v2 client-EOA relay
+  chainConfig.ts         chains, RPC / bundler / paymaster env
+  passkey/
+    constants.ts         addresses, VERIFIERS, capability table
+    webauthn.ts          authProof → Safe contract signature (§1d)
+    account.ts           AccountRef → Safe account, owner helpers
+    userOp.ts            SafeOp hash / operationData, (de)serialisation
+    gas.ts               paymaster approve + markup plan
+    relay.ts             prepare / submit (Pimlico, or handleOps in tests)
+    service.ts           prepare / submit / message / owners
+    migration.ts         EOA → passkey owner swap + calldata allowlist
+  walletconnect.ts       WalletKit sessions, two-phase approvals
+  estimateTransfer.ts    read-only fee estimate
+  estimateBridge.ts      read-only bridge quote
+  relay.ts               v2 client-EOA relay helpers
+  celo-paymaster.ts      Celo Erc20Paymaster data signer
+  markup.ts              Rift / project / flat markup calls
+  paymasterApprove.ts    Tether-safe paymaster approvals
+  testing/               virtual passkey + anvil helpers (tests only)
 scripts/
-  configure-celo-paymaster.ts
-  probe-celo-paymaster-tokens.ts
+  deploy-passkey-contracts.md
 ```
 
-## Operational notes
+## Security notes
 
-- Pushes to feat/enclave-mode auto-deploy to the Railway service
-  smart-wallet-tee. That service has SIGNING_MODE=enclave set.
-- Pushes to main auto-deploy to smartwallet.riftfi.xyz (Render).
-  That service has SIGNING_MODE unset (local mode).
-- The backend's selectSmartWalletEndpoint helper picks between the
-  two based on the X-Rift-Mode request header. Sandbox traffic goes
-  to the enclave-aware service, production stays on the legacy one
-  until prod cutover.
-- KMS_KEY_ARN must be set on the smart-wallet service when running
-  in enclave mode. The service does not call KMS itself in enclave
-  mode but it passes the ARN through to the parent-proxy.
-
-## Validation history
-
-The full enclave-signed flow has been validated end-to-end on Base
-mainnet. Sample run:
-
-- POST /api/transfer with envelope + ownerAddress arrives at
-  smart-wallet-tee.
-- smart-wallet-tee builds the UserOp and posts the userOpHash to
-  parent-proxy /sign.
-- Parent-proxy authenticates the Bearer token and forwards over
-  vsock.
-- Enclave generates an ephemeral RSA-2048 keypair, requests an NSM
-  attestation, asks KMS Decrypt with Recipient, unwraps the DEK,
-  decrypts the envelope, secp256k1 signs, zeroizes, replies.
-- Smart-wallet attaches the signature and sends the UserOp to
-  Pimlico.
-- Pimlico bundles it on chain, paymaster pays gas in the token
-  being transferred.
-- Recipient receives the funds.
-
-Example transaction hash from a 3.996 USDC transfer on Base:
-0x01a936f2226f27b0484d3700ce6ec90ba82d13ddde2bbd7c066b96cdf842e019.
-
-## Security features
-
-- Helmet for security headers.
-- Rate limit: 1000 requests per minute per IP.
-- Circuit breakers around Pimlico, Coingecko, and any other
-  upstream that can fail.
-- Address validation (viem isAddress).
-- Owner-address-against-private-key check in local mode; skipped in
-  enclave mode (the enclave will produce a signature recoverable to
-  whichever address it can sign for, and the bundler will reject any
-  mismatch).
-- CORS configurable.
-- KMS envelope decryption in local mode and enclave-routed signing
-  in enclave mode mean the plaintext private key never crosses
-  HTTPS in either configuration.
-
-## Threat model
-
-Pre-Phase-0:
-
-- Caller sent plaintext ownerPrivateKey over HTTPS.
-- Smart-wallet held the plaintext in middleware and in Express
-  request context for the lifetime of the call.
-- LB, CDN, or any proxy logging the body could capture the key.
-- Any breakpoint or memory dump on smart-wallet host could capture
-  the key.
-
-Phase 0.5 (local mode in production today):
-
-- Caller sends opaque envelope blob.
-- Smart-wallet calls KMS to decrypt in process. Plaintext lives in
-  JS memory for the lifetime of the signing call.
-- HTTPS body and any external proxy never see plaintext.
-- Memory dump on the smart-wallet host can still capture the key
-  for the short window it is in scope.
-
-Phase 2 (enclave mode in sandbox today):
-
-- Caller sends opaque envelope blob plus ownerAddress.
-- Smart-wallet never decrypts. It forwards the envelope plus the
-  userOpHash to the parent-proxy.
-- Plaintext is reconstructed only inside the Nitro Enclave, which
-  has no network, no disk, and is not introspectable by AWS, Rift,
-  or any operator.
-- KMS releases the wrapped DEK only to attestation documents whose
-  PCR0 hash matches the allowlist in the CMK key policy. Without
-  the exact enclave image you cannot decrypt, even with full IAM
-  access.
-
-## License
-
-Proprietary, Rift Finance.
+- No server-held user keys; no KMS, no enclave signing path (removed).
+- The legacy EOA key appears only in the `/api/v3/migrate` body, is used
+  for one allowlisted UserOp, and is never logged or stored. Request
+  logging never includes bodies.
+- Before submit: challenge == hashToSign, `webauthn.get`, UP+UV flags,
+  off-chain P-256 check where the key is known, and an on-chain
+  `Safe.checkSignatures` / `isValidSignature` eth_call. Origin / rpId are
+  checked by the backend (defence in depth; on-chain doesn't check them).
+- Helmet, per-IP rate limit, circuit breakers around Pimlico and RPC.

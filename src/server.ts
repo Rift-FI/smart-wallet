@@ -1,55 +1,11 @@
-import { webcrypto } from 'node:crypto';
-if (!globalThis.crypto) {
-  (globalThis as any).crypto = webcrypto;
+import { config } from './config';
+import { createApp } from './app';
+
+const app = createApp();
+
+if (!process.env.INTERNAL_SERVICE_TOKEN) {
+  console.warn('⚠️  INTERNAL_SERVICE_TOKEN is not set — every route except /health will return 503.');
 }
-
-import express from 'express';
-import cors from 'cors';
-import helmet from 'helmet';
-import compression from 'compression';
-import morgan from 'morgan';
-
-import { config, isDevelopment } from './config';
-import { errorHandler, notFoundHandler, requestLogger } from './middleware';
-import routes from './routes';
-
-// Create Express app
-const app = express();
-
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: false, // Disable CSP for API server
-  crossOriginEmbedderPolicy: false,
-}));
-
-// CORS - Open as requested
-app.use(cors({
-  origin: config.corsOrigin,
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-}));
-
-// Compression middleware
-app.use(compression());
-
-// Body parsing middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Logging middleware
-if (isDevelopment) {
-  app.use(requestLogger);
-} else {
-  app.use(morgan('combined'));
-}
-
-// Routes
-app.use('/', routes);
-
-// Error handling middleware (must be last)
-app.use(notFoundHandler);
-app.use(errorHandler);
 
 // Start server
 const server = app.listen(config.port, () => {
