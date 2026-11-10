@@ -464,7 +464,9 @@ function requestId(raw: string): number {
 
 router.post('/api/walletconnect/requests/:id/preview', checkRateLimit, async (req, res) => {
   try {
-    const r = await previewSessionRequest(requestId(String(req.params.id)));
+    const r = await previewSessionRequest(requestId(String(req.params.id)), {
+      paymasterToken: typeof req.body?.paymasterToken === "string" ? req.body.paymasterToken : undefined,
+    });
     ok(res, {
       method: r.method,
       peerName: r.peerName,

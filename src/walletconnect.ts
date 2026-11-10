@@ -315,7 +315,10 @@ export interface PreviewResult {
  * Preview a pending request: builds the UserOp / message ticket and returns
  * the hash the passkey must sign. Non-signing methods need no proof.
  */
-export async function previewSessionRequest(requestId: number): Promise<PreviewResult> {
+export async function previewSessionRequest(
+  requestId: number,
+  opts: { paymasterToken?: string } = {}
+): Promise<PreviewResult> {
   const entry = pendingRequests.get(requestId);
   if (!entry) throw new PasskeyError("TICKET_NOT_FOUND", `No pending request with id ${requestId}`);
   const { pending, sessionConfig } = entry;
@@ -339,7 +342,12 @@ export async function previewSessionRequest(requestId: number): Promise<PreviewR
       ticket = await prepareOperation({
         ...common,
         calls: [{ to: tx.to, value: tx.value || "0", data: tx.data || "0x" }],
-        gas: { mode: "sponsored" },
+        // Pay gas in the user's stablecoin when the client names one;
+        // sponsored only as the fallback.
+        gas:
+          opts.paymasterToken && /^0x[0-9a-fA-F]{40}$/.test(opts.paymasterToken)
+            ? { mode: "token", token: opts.paymasterToken }
+            : { mode: "sponsored" },
         purpose: "walletconnect",
       });
       kind = "userop";
