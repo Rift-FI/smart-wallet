@@ -45,7 +45,13 @@ import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/Pac
  *   - Only allow-listed tokens (perDay > 0) can be paid out.
  *   - Per-payout cap and a per-UTC-day cap per token for instant payouts.
  *   - Anything above the per-payout cap goes through queue(): it can only be
- *     executed after `delay` (>= MIN_DELAY), and the admin can cancel it.
+ *     executed after `delay` (>= MIN_DELAY), only by Rift (operators / admin),
+ *     and the admin can cancel it. Queued amounts have their own per-UTC-day
+ *     cap per token (queuePerDay), so one stolen operator key can queue at
+ *     most that much per day, and every queued transfer can be cancelled.
+ *   - Gas: the paymaster's standing allowance is topped up at most `gasPerDay`
+ *     per UTC day in total (<= MAX_GAS_PER_DAY), so gas spend is bounded per
+ *     day, not just per top-up.
  *   - Every payout carries a `ref` (the order id). A ref is paid at most once:
  *     a batch skips refs already used (emits Skipped) instead of paying twice,
  *     so a retried batch after an unclear result can never double pay.
@@ -61,6 +67,8 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     uint48 public constant ADMIN_TRANSFER_DELAY = 2 days;
     /// Most the gas paymaster may ever be allowed to pull (6-decimal stablecoins: 1,000 USD).
     uint128 public constant MAX_GAS_ALLOWANCE = 1_000e6;
+    /// Most the paymaster allowance may be topped up in one UTC day, in total.
+    uint128 public constant MAX_GAS_PER_DAY = 1_000e6;
     uint256 internal constant SIG_VALIDATION_FAILED = 1;
 
     /// ERC-4337 EntryPoint (v0.7) allowed to run operator-signed operations.
@@ -69,6 +77,7 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     struct Limits {
         uint128 perPayout; // largest single instant payout (token units)
         uint128 perDay; // total instant payouts per UTC day; 0 = token not allowed
+        uint128 queuePerDay; // total queued (delayed) transfers per UTC day; 0 = no queueing
     }
 
     struct Payment {
@@ -97,15 +106,21 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     address public gasPaymaster;
     /// Standing allowance kept for the paymaster per token.
     uint128 public gasAllowance;
+    /// Total allowance top-ups allowed per UTC day (all tokens together).
+    uint128 public gasPerDay;
+    /// UTC day number => allowance granted to the paymaster that day by top-ups
+    mapping(uint256 day => uint256) public gasToppedUpOnDay;
+    /// token => UTC day number => amount queued that day
+    mapping(address token => mapping(uint256 day => uint256)) public queuedOnDay;
 
     event Paid(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount, address operator);
     event Skipped(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount);
     event TransferQueued(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount, uint64 readyAt, address operator);
     event QueuedExecuted(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount);
     event QueuedCancelled(bytes32 indexed ref);
-    event LimitsSet(address indexed token, uint128 perPayout, uint128 perDay);
+    event LimitsSet(address indexed token, uint128 perPayout, uint128 perDay, uint128 queuePerDay);
     event DelaySet(uint64 delay);
-    event GasPaymasterSet(address paymaster, uint128 allowance);
+    event GasPaymasterSet(address paymaster, uint128 allowance, uint128 gasPerDay);
 
     error EmptyBatch();
     error TokenNotAllowed(address token);
@@ -124,6 +139,8 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     error NotOperator();
     error NotEntryPoint();
     error AllowanceTooHigh(uint128 allowance);
+    error OverQueueDailyLimit(address token, uint256 wouldBe, uint256 cap);
+    error GasBudgetExhausted(uint256 wouldBe, uint256 cap);
 
     constructor(
         address admin,
@@ -132,16 +149,20 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
         address[] memory tokens,
         uint128 perPayout,
         uint128 perDay,
+        uint128 queuePerDay,
         address entryPoint,
         address paymaster,
-        uint128 paymasterAllowance
+        uint128 paymasterAllowance,
+        uint128 paymasterPerDay
     ) AccessControlDefaultAdminRules(ADMIN_TRANSFER_DELAY, admin) {
         if (admin == address(0) || entryPoint == address(0)) revert ZeroAddress();
         if (paymasterAllowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(paymasterAllowance);
+        if (paymasterPerDay > MAX_GAS_PER_DAY) revert AllowanceTooHigh(paymasterPerDay);
         ENTRY_POINT = entryPoint;
         gasPaymaster = paymaster;
         gasAllowance = paymasterAllowance;
-        emit GasPaymasterSet(paymaster, paymasterAllowance);
+        gasPerDay = paymasterPerDay;
+        emit GasPaymasterSet(paymaster, paymasterAllowance, paymasterPerDay);
         if (initialDelay < MIN_DELAY) revert DelayTooShort(initialDelay);
         delay = initialDelay;
         emit DelaySet(initialDelay);
@@ -150,9 +171,12 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
             _grantRole(OPERATOR_ROLE, operators[i]);
         }
         for (uint256 i; i < tokens.length; ++i) {
-            _setLimits(tokens[i], perPayout, perDay);
-            // Tokens listed for other chains have no code here; skip their approval.
-            if (paymaster != address(0) && tokens[i].code.length > 0) _approveGas(tokens[i]);
+            _setLimits(tokens[i], perPayout, perDay, queuePerDay);
+            // Initial standing allowance (not counted against the daily top-up budget).
+            // Tokens listed for other chains have no code here; skip them.
+            if (paymaster != address(0) && tokens[i].code.length > 0) {
+                IERC20(tokens[i]).forceApprove(paymaster, paymasterAllowance);
+            }
         }
     }
 
@@ -235,7 +259,7 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
         }
         // Keep the gas paymaster's standing allowance topped up (bounded by gasAllowance).
         if (gasPaymaster != address(0) && IERC20(token).allowance(address(this), gasPaymaster) < gasAllowance / 2) {
-            _approveGas(token);
+            _approveGas(token, false);
         }
     }
 
@@ -246,14 +270,22 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
         if (amount == 0) revert ZeroAmount();
         if (ref == bytes32(0)) revert ZeroRef();
         if (refUsed[ref]) revert RefAlreadyUsed(ref);
+        uint256 day = block.timestamp / 1 days;
+        uint256 wouldBe = queuedOnDay[token][day] + amount;
+        uint256 cap = limits[token].queuePerDay;
+        if (wouldBe > cap) revert OverQueueDailyLimit(token, wouldBe, cap);
+        queuedOnDay[token][day] = wouldBe;
         refUsed[ref] = true;
         uint64 readyAt = uint64(block.timestamp) + delay;
         queued[ref] = Queued({token: token, to: to, amount: amount, readyAt: readyAt, executed: false, cancelled: false});
         emit TransferQueued(ref, token, to, amount, readyAt, msg.sender);
     }
 
-    /// Anyone may execute a queued transfer once it is ready (the backend does it automatically).
+    /// Rift (an operator, the EntryPoint on an operator's behalf, or the admin) executes a ready transfer.
     function execute(bytes32 ref) external whenNotPaused nonReentrant {
+        if (msg.sender != ENTRY_POINT && !hasRole(OPERATOR_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            revert NotOperator();
+        }
         Queued storage q = queued[ref];
         if (q.readyAt == 0) revert NotQueued(ref);
         if (q.executed || q.cancelled) revert AlreadyFinalised(ref);
@@ -289,34 +321,48 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
 
     // ─── Configuration ───────────────────────────────────────────────────
 
-    /// Admin lists / re-limits a token (perDay = 0 delists it).
-    function setLimits(address token, uint128 perPayout, uint128 perDay) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _setLimits(token, perPayout, perDay);
+    /// Admin lists / re-limits a token (perDay = 0 delists it; queuePerDay = 0 disables queueing).
+    function setLimits(address token, uint128 perPayout, uint128 perDay, uint128 queuePerDay) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _setLimits(token, perPayout, perDay, queuePerDay);
     }
 
-    function _setLimits(address token, uint128 perPayout, uint128 perDay) internal {
+    function _setLimits(address token, uint128 perPayout, uint128 perDay, uint128 queuePerDay) internal {
         if (token == address(0)) revert ZeroAddress();
         if (perPayout > perDay) revert BadLimits();
-        limits[token] = Limits({perPayout: perPayout, perDay: perDay});
-        emit LimitsSet(token, perPayout, perDay);
+        limits[token] = Limits({perPayout: perPayout, perDay: perDay, queuePerDay: queuePerDay});
+        emit LimitsSet(token, perPayout, perDay, queuePerDay);
     }
 
     /// Re-approve the gas paymaster up to `gasAllowance` for a listed token.
     function refreshGasAllowance(address token) external onlyOperatorOrEntryPoint {
         if (limits[token].perDay == 0) revert TokenNotAllowed(token);
-        _approveGas(token);
+        _approveGas(token, true);
     }
 
     /// Admin switches the gas paymaster (zero address turns gasless off).
-    function setGasPaymaster(address paymaster, uint128 allowance) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setGasPaymaster(address paymaster, uint128 allowance, uint128 perDay) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (allowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(allowance);
+        if (perDay > MAX_GAS_PER_DAY) revert AllowanceTooHigh(perDay);
         gasPaymaster = paymaster;
         gasAllowance = allowance;
-        emit GasPaymasterSet(paymaster, allowance);
+        gasPerDay = perDay;
+        emit GasPaymasterSet(paymaster, allowance, perDay);
     }
 
-    function _approveGas(address token) internal {
+    /// Top the paymaster back up to `gasAllowance`, counting the top-up against today's gas budget.
+    /// strict: revert when over budget; otherwise skip quietly (payouts must not fail over gas top-ups).
+    function _approveGas(address token, bool strict) internal {
         if (gasPaymaster == address(0)) return;
+        uint256 current = IERC20(token).allowance(address(this), gasPaymaster);
+        if (current >= gasAllowance) return;
+        uint256 topUp = gasAllowance - current;
+        uint256 day = block.timestamp / 1 days;
+        uint256 wouldBe = gasToppedUpOnDay[day] + topUp;
+        if (wouldBe > gasPerDay) {
+            if (strict) revert GasBudgetExhausted(wouldBe, gasPerDay);
+            return;
+        }
+        gasToppedUpOnDay[day] = wouldBe;
         IERC20(token).forceApprove(gasPaymaster, gasAllowance);
     }
 

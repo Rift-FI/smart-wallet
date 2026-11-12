@@ -35,6 +35,7 @@ contract RiftPayoutVaultTest is Test {
     uint128 constant ONE = 1e6; // 1 USDC
     uint128 constant PER_PAYOUT = 5_000 * ONE;
     uint128 constant PER_DAY = 50_000 * ONE;
+    uint128 constant QUEUE_PER_DAY = 1_000_000 * ONE;
 
     function setUp() public {
         vm.warp(1_800_000_000);
@@ -46,7 +47,7 @@ contract RiftPayoutVaultTest is Test {
         address[] memory toks = new address[](1);
         toks[0] = address(usdc);
         ep = new EntryPoint();
-        vault = new RiftPayoutVault(admin, ops, 24 hours, toks, PER_PAYOUT, PER_DAY, address(ep), paymaster, 50 * ONE);
+        vault = new RiftPayoutVault(admin, ops, 24 hours, toks, PER_PAYOUT, PER_DAY, QUEUE_PER_DAY, address(ep), paymaster, 50 * ONE, 200 * ONE);
         usdc.mint(address(vault), 1_000_000 * ONE);
     }
 
@@ -147,7 +148,7 @@ contract RiftPayoutVaultTest is Test {
     function test_insufficientBalanceRevertsNothingPaid() public {
         MockUSDC poor = new MockUSDC();
         vm.prank(admin);
-        vault.setLimits(address(poor), PER_PAYOUT, PER_DAY);
+        vault.setLimits(address(poor), PER_PAYOUT, PER_DAY, QUEUE_PER_DAY);
         poor.mint(address(vault), 50 * ONE);
         RiftPayoutVault.Payment[] memory ps = new RiftPayoutVault.Payment[](2);
         ps[0] = RiftPayoutVault.Payment({to: alice, amount: 40 * ONE, ref: "a"});
@@ -168,9 +169,13 @@ contract RiftPayoutVaultTest is Test {
         vm.expectRevert();
         vault.execute("lp-withdraw-1");
         vm.warp(block.timestamp + 24 hours);
-        vm.prank(stranger); // anyone can execute once ready
+        vm.prank(stranger); // only Rift can execute, even once ready
+        vm.expectRevert(RiftPayoutVault.NotOperator.selector);
+        vault.execute("lp-withdraw-1");
+        vm.prank(op2);
         vault.execute("lp-withdraw-1");
         assertEq(usdc.balanceOf(bob), big);
+        vm.prank(op2);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.AlreadyFinalised.selector, bytes32("lp-withdraw-1")));
         vault.execute("lp-withdraw-1");
     }
@@ -181,6 +186,7 @@ contract RiftPayoutVaultTest is Test {
         vm.prank(admin);
         vault.cancel("suspicious");
         vm.warp(block.timestamp + 2 days);
+        vm.prank(op1);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.AlreadyFinalised.selector, bytes32("suspicious")));
         vault.execute("suspicious");
         assertEq(usdc.balanceOf(stranger), 0);
@@ -228,6 +234,7 @@ contract RiftPayoutVaultTest is Test {
         vm.warp(block.timestamp + 24 hours);
         vm.prank(admin);
         vault.pause();
+        vm.prank(op1);
         vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.execute("q");
     }
@@ -241,15 +248,15 @@ contract RiftPayoutVaultTest is Test {
     // ── configuration ────────────────────────────────────────────────
 
     function test_constructorListsTokens_onlyAdminChangesLimits() public {
-        (uint128 pp, uint128 pd) = vault.limits(address(usdc));
+        (uint128 pp, uint128 pd,) = vault.limits(address(usdc));
         assertEq(pp, PER_PAYOUT);
         assertEq(pd, PER_DAY);
         vm.prank(op1);
         vm.expectRevert();
-        vault.setLimits(address(usdc), 1, 1);
+        vault.setLimits(address(usdc), 1, 1, 1);
         vm.prank(admin);
-        vault.setLimits(address(usdc), 1, 2);
-        (pp, pd) = vault.limits(address(usdc));
+        vault.setLimits(address(usdc), 1, 2, 3);
+        (pp, pd,) = vault.limits(address(usdc));
         assertEq(pp, 1);
         assertEq(pd, 2);
     }
@@ -258,7 +265,7 @@ contract RiftPayoutVaultTest is Test {
         // An address listed for another chain has no code here: nothing can be paid.
         address foreign = address(0xBEEF);
         vm.prank(admin);
-        vault.setLimits(foreign, PER_PAYOUT, PER_DAY);
+        vault.setLimits(foreign, PER_PAYOUT, PER_DAY, QUEUE_PER_DAY);
         vm.prank(op1);
         vm.expectRevert();
         vault.payout(foreign, _one(alice, ONE, "x"));
@@ -267,7 +274,7 @@ contract RiftPayoutVaultTest is Test {
     function test_limitsMustBeSane() public {
         vm.prank(admin);
         vm.expectRevert(RiftPayoutVault.BadLimits.selector);
-        vault.setLimits(address(usdc), 10, 5);
+        vault.setLimits(address(usdc), 10, 5, 0);
     }
 
     function test_delayFloor() public {
@@ -276,7 +283,7 @@ contract RiftPayoutVaultTest is Test {
         vault.setDelay(10 minutes);
         address[] memory ops = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.DelayTooShort.selector, uint64(0)));
-        new RiftPayoutVault(admin, ops, 0, new address[](0), 1, 1, address(ep), paymaster, 50 * ONE);
+        new RiftPayoutVault(admin, ops, 0, new address[](0), 1, 1, 1, address(ep), paymaster, 50 * ONE, 200 * ONE);
     }
 
     function test_adminManagesOperators() public {
@@ -316,7 +323,7 @@ contract RiftPayoutVaultTest is Test {
 
     function test_gas_batchOf200() public {
         vm.prank(admin);
-        vault.setLimits(address(usdc), PER_PAYOUT, 1_000_000 * ONE);
+        vault.setLimits(address(usdc), PER_PAYOUT, 1_000_000 * ONE, QUEUE_PER_DAY);
         RiftPayoutVault.Payment[] memory ps = new RiftPayoutVault.Payment[](200);
         for (uint256 i; i < 200; ++i) {
             ps[i] = RiftPayoutVault.Payment({to: address(uint160(0x1000 + i)), amount: 10 * ONE, ref: bytes32(i + 1000)});
@@ -395,11 +402,11 @@ contract RiftPayoutVaultTest is Test {
     function test_gasless_operatorCannotCallAdminFunctions() public {
         vm.deal(address(this), 1 ether);
         ep.depositTo{value: 1 ether}(address(vault));
-        bytes memory call_ = abi.encodeCall(RiftPayoutVault.setLimits, (address(usdc), type(uint128).max, type(uint128).max));
+        bytes memory call_ = abi.encodeCall(RiftPayoutVault.setLimits, (address(usdc), type(uint128).max, type(uint128).max, type(uint128).max));
         PackedUserOperation memory op = _userOp(call_, op1Key);
         vm.expectRevert();
         _handle(op);
-        (uint128 pp,) = vault.limits(address(usdc));
+        (uint128 pp,,) = vault.limits(address(usdc));
         assertEq(pp, PER_PAYOUT);
     }
 
@@ -434,6 +441,60 @@ contract RiftPayoutVaultTest is Test {
     function test_gasAllowanceCappedByContract() public {
         vm.prank(admin);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.AllowanceTooHigh.selector, uint128(1_001e6)));
-        vault.setGasPaymaster(paymaster, 1_001e6);
+        vault.setGasPaymaster(paymaster, 1_001e6, 200 * ONE);
+    }
+
+    // ── v3: queue + gas daily caps ───────────────────────────────────
+
+    function test_queueDailyCapPerToken() public {
+        vm.prank(admin);
+        vault.setLimits(address(usdc), PER_PAYOUT, PER_DAY, 30_000 * ONE);
+        vm.startPrank(op1);
+        vault.queue(address(usdc), bob, 20_000 * ONE, "q1");
+        vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.OverQueueDailyLimit.selector, address(usdc), uint256(31_000 * ONE), uint256(30_000 * ONE)));
+        vault.queue(address(usdc), bob, 11_000 * ONE, "q2");
+        vault.queue(address(usdc), bob, 10_000 * ONE, "q3");
+        vm.stopPrank();
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(op1);
+        vault.queue(address(usdc), bob, 30_000 * ONE, "q4"); // new day, new budget
+    }
+
+    function test_queueDisabledWhenCapZero() public {
+        vm.prank(admin);
+        vault.setLimits(address(usdc), PER_PAYOUT, PER_DAY, 0);
+        vm.prank(op1);
+        vm.expectRevert();
+        vault.queue(address(usdc), bob, ONE, "q");
+    }
+
+    function test_gasTopUpsBoundedPerDay() public {
+        // 200/day budget, 50 standing allowance: at most 4 full top-ups a day.
+        for (uint256 i; i < 4; ++i) {
+            vm.prank(paymaster);
+            usdc.transferFrom(address(vault), paymaster, 50 * ONE);
+            vm.prank(op1);
+            vault.refreshGasAllowance(address(usdc));
+        }
+        vm.prank(paymaster);
+        usdc.transferFrom(address(vault), paymaster, 50 * ONE);
+        vm.prank(op1);
+        vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.GasBudgetExhausted.selector, uint256(250 * ONE), uint256(200 * ONE)));
+        vault.refreshGasAllowance(address(usdc));
+        // payout() skips the top-up quietly instead of failing the payout
+        vm.prank(op1);
+        vault.payout(address(usdc), _one(alice, ONE, "still-pays"));
+        assertEq(usdc.balanceOf(alice), ONE);
+        assertEq(usdc.allowance(address(vault), paymaster), 0);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(op1);
+        vault.refreshGasAllowance(address(usdc));
+        assertEq(usdc.allowance(address(vault), paymaster), 50 * ONE);
+    }
+
+    function test_gasPerDayCappedByContract() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.AllowanceTooHigh.selector, uint128(1_001e6)));
+        vault.setGasPaymaster(paymaster, 50 * ONE, 1_001e6);
     }
 }
