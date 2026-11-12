@@ -174,3 +174,4 @@ wallets/
 *.pem
 # Local-only debug script; contained secrets (removed from tracking)
 decrypt.js
+contracts/vault-deploy.json

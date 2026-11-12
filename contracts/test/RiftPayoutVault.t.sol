@@ -19,7 +19,6 @@ contract RiftPayoutVaultTest is Test {
     MockUSDC other;
 
     address admin = makeAddr("admin");
-    address configurator = makeAddr("configurator");
     address op1 = makeAddr("op1");
     address op2 = makeAddr("op2");
     address alice = makeAddr("alice");
@@ -37,9 +36,9 @@ contract RiftPayoutVaultTest is Test {
         address[] memory ops = new address[](2);
         ops[0] = op1;
         ops[1] = op2;
-        vault = new RiftPayoutVault(admin, configurator, ops, 24 hours);
-        vm.prank(configurator);
-        vault.setLimits(address(usdc), PER_PAYOUT, PER_DAY);
+        address[] memory toks = new address[](1);
+        toks[0] = address(usdc);
+        vault = new RiftPayoutVault(admin, ops, 24 hours, toks, PER_PAYOUT, PER_DAY);
         usdc.mint(address(vault), 1_000_000 * ONE);
     }
 
@@ -140,7 +139,7 @@ contract RiftPayoutVaultTest is Test {
 
     function test_insufficientBalanceRevertsNothingPaid() public {
         MockUSDC poor = new MockUSDC();
-        vm.prank(configurator);
+        vm.prank(admin);
         vault.setLimits(address(poor), PER_PAYOUT, PER_DAY);
         poor.mint(address(vault), 50 * ONE);
         RiftPayoutVault.Payment[] memory ps = new RiftPayoutVault.Payment[](2);
@@ -234,17 +233,28 @@ contract RiftPayoutVaultTest is Test {
 
     // ── configuration ────────────────────────────────────────────────
 
-    function test_configuratorGivesUpSetupForGood() public {
-        vm.prank(configurator);
-        vault.finishSetup();
-        vm.prank(configurator);
+    function test_constructorListsTokens_onlyAdminChangesLimits() public {
+        (uint128 pp, uint128 pd) = vault.limits(address(usdc));
+        assertEq(pp, PER_PAYOUT);
+        assertEq(pd, PER_DAY);
+        vm.prank(op1);
         vm.expectRevert();
         vault.setLimits(address(usdc), 1, 1);
         vm.prank(admin);
         vault.setLimits(address(usdc), 1, 2);
-        (uint128 pp, uint128 pd) = vault.limits(address(usdc));
+        (pp, pd) = vault.limits(address(usdc));
         assertEq(pp, 1);
         assertEq(pd, 2);
+    }
+
+    function test_tokenListedForAnotherChainIsInert() public {
+        // An address listed for another chain has no code here: nothing can be paid.
+        address foreign = address(0xBEEF);
+        vm.prank(admin);
+        vault.setLimits(foreign, PER_PAYOUT, PER_DAY);
+        vm.prank(op1);
+        vm.expectRevert();
+        vault.payout(foreign, _one(alice, ONE, "x"));
     }
 
     function test_limitsMustBeSane() public {
@@ -259,7 +269,7 @@ contract RiftPayoutVaultTest is Test {
         vault.setDelay(10 minutes);
         address[] memory ops = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.DelayTooShort.selector, uint64(0)));
-        new RiftPayoutVault(admin, configurator, ops, 0);
+        new RiftPayoutVault(admin, ops, 0, new address[](0), 1, 1);
     }
 
     function test_adminManagesOperators() public {

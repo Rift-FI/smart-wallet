@@ -22,10 +22,12 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *                            and can pause in an emergency. Many operator
  *                            keys can send in parallel (each has its own nonce),
  *                            and each call can pay a whole batch.
- *   configurator (deployer)  one-time setup of token limits right after
- *                            deployment, then gives the role up for good.
- *                            Keeps the constructor identical on every chain, so
- *                            the vault can have the same address everywhere.
+ *
+ * Deployment: one transaction per chain through the standard CREATE2 factory,
+ * with identical constructor arguments everywhere, so the vault has the same
+ * address on every chain and needs no follow-up setup. The token list holds
+ * USDC + USDT for every supported chain; on a given chain the other chains'
+ * addresses are inert (the vault never holds them, so nothing can be paid).
  *
  * Safety
  *   - Only allow-listed tokens (perDay > 0) can be paid out.
@@ -40,7 +42,6 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
-    bytes32 public constant CONFIGURATOR_ROLE = keccak256("CONFIGURATOR_ROLE");
 
     /// Queued transfers wait at least this long, whatever the admin sets.
     uint64 public constant MIN_DELAY = 1 hours;
@@ -82,7 +83,6 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     event QueuedCancelled(bytes32 indexed ref);
     event LimitsSet(address indexed token, uint128 perPayout, uint128 perDay);
     event DelaySet(uint64 delay);
-    event SetupFinished(address configurator);
 
     error EmptyBatch();
     error TokenNotAllowed(address token);
@@ -99,18 +99,23 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     error BadLimits();
     error NoNativeToken();
 
-    constructor(address admin, address configurator, address[] memory operators, uint64 initialDelay)
-        AccessControlDefaultAdminRules(ADMIN_TRANSFER_DELAY, admin)
-    {
-        if (admin == address(0) || configurator == address(0)) revert ZeroAddress();
+    constructor(
+        address admin,
+        address[] memory operators,
+        uint64 initialDelay,
+        address[] memory tokens,
+        uint128 perPayout,
+        uint128 perDay
+    ) AccessControlDefaultAdminRules(ADMIN_TRANSFER_DELAY, admin) {
+        if (admin == address(0)) revert ZeroAddress();
         if (initialDelay < MIN_DELAY) revert DelayTooShort(initialDelay);
         delay = initialDelay;
-        _grantRole(CONFIGURATOR_ROLE, configurator);
+        emit DelaySet(initialDelay);
         for (uint256 i; i < operators.length; ++i) {
             if (operators[i] == address(0)) revert ZeroAddress();
             _grantRole(OPERATOR_ROLE, operators[i]);
         }
-        emit DelaySet(initialDelay);
+        for (uint256 i; i < tokens.length; ++i) _setLimits(tokens[i], perPayout, perDay);
     }
 
     // ─── Payouts ─────────────────────────────────────────────────────────
@@ -206,20 +211,16 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
 
     // ─── Configuration ───────────────────────────────────────────────────
 
-    function setLimits(address token, uint128 perPayout, uint128 perDay) external {
-        if (!hasRole(DEFAULT_ADMIN_ROLE, msg.sender) && !hasRole(CONFIGURATOR_ROLE, msg.sender)) {
-            revert AccessControlUnauthorizedAccount(msg.sender, DEFAULT_ADMIN_ROLE);
-        }
+    /// Admin lists / re-limits a token (perDay = 0 delists it).
+    function setLimits(address token, uint128 perPayout, uint128 perDay) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _setLimits(token, perPayout, perDay);
+    }
+
+    function _setLimits(address token, uint128 perPayout, uint128 perDay) internal {
         if (token == address(0)) revert ZeroAddress();
         if (perPayout > perDay) revert BadLimits();
         limits[token] = Limits({perPayout: perPayout, perDay: perDay});
         emit LimitsSet(token, perPayout, perDay);
-    }
-
-    /// Configurator gives up its setup rights for good.
-    function finishSetup() external onlyRole(CONFIGURATOR_ROLE) {
-        _revokeRole(CONFIGURATOR_ROLE, msg.sender);
-        emit SetupFinished(msg.sender);
     }
 
     function setDelay(uint64 newDelay) external onlyRole(DEFAULT_ADMIN_ROLE) {
