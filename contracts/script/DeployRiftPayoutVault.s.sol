@@ -21,12 +21,17 @@ import {RiftPayoutVault} from "../src/RiftPayoutVault.sol";
  *   VAULT_ADMIN       owner (cold / treasury wallet). Required.
  *   VAULT_OPERATORS   comma-separated backend operator addresses. Required.
  *   VAULT_DELAY       seconds big transfers wait (default 86400, min 3600).
- *   VAULT_SALT        CREATE2 salt string (default "rift-payout-vault-v1").
+ *   VAULT_SALT        CREATE2 salt string (default "rift-payout-vault-v2").
+ *   VAULT_GAS_ALLOWANCE  most the gas paymaster may pull, whole USD (default 50, max 1000).
  *   VAULT_PER_PAYOUT  largest instant payout, whole USD (default 5000).
  *   VAULT_PER_DAY     instant payouts per UTC day per token, whole USD (default 100000).
  */
 contract DeployRiftPayoutVaultScript is Script {
     address constant FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    /// ERC-4337 EntryPoint v0.7 (same address on every chain).
+    address constant ENTRY_POINT = 0x0000000071727De22E5E9d8BAf0edAc6f37da032;
+    /// Pimlico ERC-20 paymaster (same address on every chain): gas paid in the vault's USDC.
+    address constant GAS_PAYMASTER = 0x777777777777AeC03fd955926DbF81597e66834C;
 
     /// USDC + USDT on Base, Ethereum, Arbitrum, Polygon (all 6 decimals).
     function tokens() internal pure returns (address[] memory t) {
@@ -45,12 +50,13 @@ contract DeployRiftPayoutVaultScript is Script {
         address admin = vm.envAddress("VAULT_ADMIN");
         address[] memory operators = vm.envAddress("VAULT_OPERATORS", ",");
         uint64 delay = uint64(vm.envOr("VAULT_DELAY", uint256(86400)));
-        bytes32 salt = keccak256(bytes(vm.envOr("VAULT_SALT", string("rift-payout-vault-v1"))));
+        bytes32 salt = keccak256(bytes(vm.envOr("VAULT_SALT", string("rift-payout-vault-v2"))));
+        uint128 gasAllowance = uint128(vm.envOr("VAULT_GAS_ALLOWANCE", uint256(50))) * 1e6;
         uint128 perPayout = uint128(vm.envOr("VAULT_PER_PAYOUT", uint256(5_000))) * 1e6;
         uint128 perDay = uint128(vm.envOr("VAULT_PER_DAY", uint256(100_000))) * 1e6;
 
         bytes memory init = abi.encodePacked(
-            type(RiftPayoutVault).creationCode, abi.encode(admin, operators, delay, tokens(), perPayout, perDay)
+            type(RiftPayoutVault).creationCode, abi.encode(admin, operators, delay, tokens(), perPayout, perDay, ENTRY_POINT, GAS_PAYMASTER, gasAllowance)
         );
         address predicted = vm.computeCreate2Address(salt, keccak256(init), FACTORY);
         bytes memory factoryCalldata = abi.encodePacked(salt, init);

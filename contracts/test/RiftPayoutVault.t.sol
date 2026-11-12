@@ -6,6 +6,10 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {RiftPayoutVault} from "../src/RiftPayoutVault.sol";
+import {EntryPoint} from "@account-abstraction/contracts/core/EntryPoint.sol";
+import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
+import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USD Coin", "USDC") {}
@@ -15,11 +19,14 @@ contract MockUSDC is ERC20 {
 
 contract RiftPayoutVaultTest is Test {
     RiftPayoutVault vault;
+    EntryPoint ep;
     MockUSDC usdc;
     MockUSDC other;
 
     address admin = makeAddr("admin");
-    address op1 = makeAddr("op1");
+    uint256 op1Key = 0xA11CE;
+    address op1 = vm.addr(op1Key);
+    address paymaster = makeAddr("paymaster");
     address op2 = makeAddr("op2");
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
@@ -38,7 +45,8 @@ contract RiftPayoutVaultTest is Test {
         ops[1] = op2;
         address[] memory toks = new address[](1);
         toks[0] = address(usdc);
-        vault = new RiftPayoutVault(admin, ops, 24 hours, toks, PER_PAYOUT, PER_DAY);
+        ep = new EntryPoint();
+        vault = new RiftPayoutVault(admin, ops, 24 hours, toks, PER_PAYOUT, PER_DAY, address(ep), paymaster, 50 * ONE);
         usdc.mint(address(vault), 1_000_000 * ONE);
     }
 
@@ -111,9 +119,8 @@ contract RiftPayoutVaultTest is Test {
     }
 
     function test_onlyOperatorsPay() public {
-        bytes32 role = vault.OPERATOR_ROLE();
         vm.prank(stranger);
-        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, role));
+        vm.expectRevert(RiftPayoutVault.NotOperator.selector);
         vault.payout(address(usdc), _one(stranger, ONE, "x"));
     }
 
@@ -269,7 +276,7 @@ contract RiftPayoutVaultTest is Test {
         vault.setDelay(10 minutes);
         address[] memory ops = new address[](0);
         vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.DelayTooShort.selector, uint64(0)));
-        new RiftPayoutVault(admin, ops, 0, new address[](0), 1, 1);
+        new RiftPayoutVault(admin, ops, 0, new address[](0), 1, 1, address(ep), paymaster, 50 * ONE);
     }
 
     function test_adminManagesOperators() public {
@@ -339,5 +346,94 @@ contract RiftPayoutVaultTest is Test {
         }
         assertEq(usdc.balanceOf(alice), total);
         assertLe(total, PER_DAY);
+    }
+
+    // ── gasless (ERC-4337) ───────────────────────────────────────────
+
+    function _userOp(bytes memory callData, uint256 signerKey) internal view returns (PackedUserOperation memory op) {
+        op = PackedUserOperation({
+            sender: address(vault),
+            nonce: ep.getNonce(address(vault), 0),
+            initCode: "",
+            callData: callData,
+            accountGasLimits: bytes32((uint256(300_000) << 128) | uint256(500_000)),
+            preVerificationGas: 60_000,
+            gasFees: bytes32((uint256(1 gwei) << 128) | uint256(1 gwei)),
+            paymasterAndData: "",
+            signature: ""
+        });
+        bytes32 h = ep.getUserOpHash(op);
+        (uint8 v, bytes32 r, bytes32 s_) = vm.sign(signerKey, MessageHashUtils.toEthSignedMessageHash(h));
+        op.signature = abi.encodePacked(r, s_, v);
+    }
+
+    function _handle(PackedUserOperation memory op) internal {
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = op;
+        ep.handleOps(ops, payable(makeAddr("bundler")));
+    }
+
+    function test_gasless_operatorSignedPayoutRunsThroughEntryPoint() public {
+        vm.deal(address(this), 1 ether);
+        ep.depositTo{value: 1 ether}(address(vault)); // stands in for the paymaster in this test
+        bytes memory call_ = abi.encodeCall(RiftPayoutVault.payout, (address(usdc), _one(alice, 42 * ONE, "4337-a")));
+        _handle(_userOp(call_, op1Key));
+        assertEq(usdc.balanceOf(alice), 42 * ONE);
+        assertTrue(vault.refUsed("4337-a"));
+    }
+
+    function test_gasless_strangerSignatureRejected() public {
+        vm.deal(address(this), 1 ether);
+        ep.depositTo{value: 1 ether}(address(vault));
+        bytes memory call_ = abi.encodeCall(RiftPayoutVault.payout, (address(usdc), _one(stranger, 42 * ONE, "evil")));
+        PackedUserOperation memory op = _userOp(call_, 0xBAD);
+        vm.expectRevert();
+        _handle(op);
+        assertEq(usdc.balanceOf(stranger), 0);
+    }
+
+    function test_gasless_operatorCannotCallAdminFunctions() public {
+        vm.deal(address(this), 1 ether);
+        ep.depositTo{value: 1 ether}(address(vault));
+        bytes memory call_ = abi.encodeCall(RiftPayoutVault.setLimits, (address(usdc), type(uint128).max, type(uint128).max));
+        PackedUserOperation memory op = _userOp(call_, op1Key);
+        vm.expectRevert();
+        _handle(op);
+        (uint128 pp,) = vault.limits(address(usdc));
+        assertEq(pp, PER_PAYOUT);
+    }
+
+    function test_gasless_capsStillApplyThroughEntryPoint() public {
+        vm.deal(address(this), 1 ether);
+        ep.depositTo{value: 1 ether}(address(vault));
+        bytes memory call_ = abi.encodeCall(RiftPayoutVault.payout, (address(usdc), _one(alice, PER_PAYOUT + 1, "big")));
+        _handle(_userOp(call_, op1Key)); // the op is valid; the inner call reverts on the cap
+        assertEq(usdc.balanceOf(alice), 0);
+        assertFalse(vault.refUsed("big"));
+    }
+
+    function test_onlyEntryPointCanValidate() public {
+        PackedUserOperation memory op = _userOp(abi.encodeCall(RiftPayoutVault.pause, ()), op1Key);
+        vm.expectRevert(RiftPayoutVault.NotEntryPoint.selector);
+        vault.validateUserOp(op, bytes32(0), 0);
+    }
+
+    function test_paymasterAllowanceBoundedAndToppedUp() public {
+        assertEq(usdc.allowance(address(vault), paymaster), 50 * ONE);
+        vm.prank(paymaster); // paymaster spends some gas money
+        usdc.transferFrom(address(vault), paymaster, 40 * ONE);
+        assertEq(usdc.allowance(address(vault), paymaster), 10 * ONE);
+        vm.prank(op1);
+        vault.payout(address(usdc), _one(alice, ONE, "topup"));
+        assertEq(usdc.allowance(address(vault), paymaster), 50 * ONE); // back to the cap, never more
+        vm.prank(paymaster);
+        vm.expectRevert();
+        usdc.transferFrom(address(vault), paymaster, 51 * ONE);
+    }
+
+    function test_gasAllowanceCappedByContract() public {
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(RiftPayoutVault.AllowanceTooHigh.selector, uint128(1_001e6)));
+        vault.setGasPaymaster(paymaster, 1_001e6);
     }
 }

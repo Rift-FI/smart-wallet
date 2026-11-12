@@ -6,6 +6,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {AccessControlDefaultAdminRules} from "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {IAccount} from "@account-abstraction/contracts/interfaces/IAccount.sol";
+import {PackedUserOperation} from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
 
 /**
  * @title RiftPayoutVault
@@ -23,6 +27,14 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *                            keys can send in parallel (each has its own nonce),
  *                            and each call can pay a whole batch.
  *
+ * Gasless (ERC-4337): the vault is its own smart account. Operator keys only
+ * SIGN user operations (no ETH anywhere); a bundler submits them through the
+ * EntryPoint, and gas is paid in the vault's own USDC via an ERC-20 paymaster
+ * (Pimlico's). validateUserOp accepts an operation only if an operator signed
+ * it AND it calls payout / queue / execute / pause / refreshGasAllowance, so a
+ * user operation can never do more than an operator could directly. The
+ * paymaster can pull at most `gasAllowance` (capped at MAX_GAS_ALLOWANCE).
+ *
  * Deployment: one transaction per chain through the standard CREATE2 factory,
  * with identical constructor arguments everywhere, so the vault has the same
  * address on every chain and needs no follow-up setup. The token list holds
@@ -38,7 +50,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
  *     a batch skips refs already used (emits Skipped) instead of paying twice,
  *     so a retried batch after an unclear result can never double pay.
  */
-contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, ReentrancyGuard {
+contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
@@ -47,6 +59,12 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     uint64 public constant MIN_DELAY = 1 hours;
     /// Admin changes wait this long before the new admin can take over.
     uint48 public constant ADMIN_TRANSFER_DELAY = 2 days;
+    /// Most the gas paymaster may ever be allowed to pull (6-decimal stablecoins: 1,000 USD).
+    uint128 public constant MAX_GAS_ALLOWANCE = 1_000e6;
+    uint256 internal constant SIG_VALIDATION_FAILED = 1;
+
+    /// ERC-4337 EntryPoint (v0.7) allowed to run operator-signed operations.
+    address public immutable ENTRY_POINT;
 
     struct Limits {
         uint128 perPayout; // largest single instant payout (token units)
@@ -75,6 +93,10 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     mapping(bytes32 ref => bool) public refUsed;
     mapping(bytes32 ref => Queued) public queued;
     uint64 public delay;
+    /// ERC-20 paymaster that charges this vault's stablecoin for gas.
+    address public gasPaymaster;
+    /// Standing allowance kept for the paymaster per token.
+    uint128 public gasAllowance;
 
     event Paid(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount, address operator);
     event Skipped(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount);
@@ -83,6 +105,7 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     event QueuedCancelled(bytes32 indexed ref);
     event LimitsSet(address indexed token, uint128 perPayout, uint128 perDay);
     event DelaySet(uint64 delay);
+    event GasPaymasterSet(address paymaster, uint128 allowance);
 
     error EmptyBatch();
     error TokenNotAllowed(address token);
@@ -98,6 +121,9 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
     error DelayTooShort(uint64 delay);
     error BadLimits();
     error NoNativeToken();
+    error NotOperator();
+    error NotEntryPoint();
+    error AllowanceTooHigh(uint128 allowance);
 
     constructor(
         address admin,
@@ -105,9 +131,17 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
         uint64 initialDelay,
         address[] memory tokens,
         uint128 perPayout,
-        uint128 perDay
+        uint128 perDay,
+        address entryPoint,
+        address paymaster,
+        uint128 paymasterAllowance
     ) AccessControlDefaultAdminRules(ADMIN_TRANSFER_DELAY, admin) {
-        if (admin == address(0)) revert ZeroAddress();
+        if (admin == address(0) || entryPoint == address(0)) revert ZeroAddress();
+        if (paymasterAllowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(paymasterAllowance);
+        ENTRY_POINT = entryPoint;
+        gasPaymaster = paymaster;
+        gasAllowance = paymasterAllowance;
+        emit GasPaymasterSet(paymaster, paymasterAllowance);
         if (initialDelay < MIN_DELAY) revert DelayTooShort(initialDelay);
         delay = initialDelay;
         emit DelaySet(initialDelay);
@@ -115,7 +149,47 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
             if (operators[i] == address(0)) revert ZeroAddress();
             _grantRole(OPERATOR_ROLE, operators[i]);
         }
-        for (uint256 i; i < tokens.length; ++i) _setLimits(tokens[i], perPayout, perDay);
+        for (uint256 i; i < tokens.length; ++i) {
+            _setLimits(tokens[i], perPayout, perDay);
+            // Tokens listed for other chains have no code here; skip their approval.
+            if (paymaster != address(0) && tokens[i].code.length > 0) _approveGas(tokens[i]);
+        }
+    }
+
+    modifier onlyOperatorOrEntryPoint() {
+        if (msg.sender != ENTRY_POINT && !hasRole(OPERATOR_ROLE, msg.sender)) revert NotOperator();
+        _;
+    }
+
+    // ─── ERC-4337 ────────────────────────────────────────────────────────
+
+    /// Accept an operation only if an operator signed it and it calls an operator function.
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+        external
+        returns (uint256 validationData)
+    {
+        if (msg.sender != ENTRY_POINT) revert NotEntryPoint();
+        validationData = _isOperatorCall(userOp.callData) && _signedByOperator(userOpHash, userOp.signature)
+            ? 0
+            : SIG_VALIDATION_FAILED;
+        if (missingAccountFunds > 0) {
+            // Only without a paymaster; the vault normally holds no ETH, so this just fails the op.
+            (bool ok,) = payable(msg.sender).call{value: missingAccountFunds}("");
+            ok;
+        }
+    }
+
+    function _isOperatorCall(bytes calldata callData) internal pure returns (bool) {
+        if (callData.length < 4) return false;
+        bytes4 sel = bytes4(callData[:4]);
+        return sel == this.payout.selector || sel == this.queue.selector || sel == this.execute.selector
+            || sel == this.pause.selector || sel == this.refreshGasAllowance.selector;
+    }
+
+    function _signedByOperator(bytes32 userOpHash, bytes calldata signature) internal view returns (bool) {
+        (address signer, ECDSA.RecoverError err,) =
+            ECDSA.tryRecover(MessageHashUtils.toEthSignedMessageHash(userOpHash), signature);
+        return err == ECDSA.RecoverError.NoError && hasRole(OPERATOR_ROLE, signer);
     }
 
     // ─── Payouts ─────────────────────────────────────────────────────────
@@ -127,7 +201,7 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
      */
     function payout(address token, Payment[] calldata payments)
         external
-        onlyRole(OPERATOR_ROLE)
+        onlyOperatorOrEntryPoint
         whenNotPaused
         nonReentrant
         returns (uint256 paidCount, uint256 paidTotal)
@@ -159,10 +233,14 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
             if (wouldBe > l.perDay) revert OverDailyLimit(token, wouldBe, l.perDay);
             spentOnDay[token][day] = wouldBe;
         }
+        // Keep the gas paymaster's standing allowance topped up (bounded by gasAllowance).
+        if (gasPaymaster != address(0) && IERC20(token).allowance(address(this), gasPaymaster) < gasAllowance / 2) {
+            _approveGas(token);
+        }
     }
 
     /// Queue a transfer of any size; it can be executed after `delay` unless the admin cancels it.
-    function queue(address token, address to, uint128 amount, bytes32 ref) external onlyRole(OPERATOR_ROLE) whenNotPaused {
+    function queue(address token, address to, uint128 amount, bytes32 ref) external onlyOperatorOrEntryPoint whenNotPaused {
         if (limits[token].perDay == 0) revert TokenNotAllowed(token);
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
@@ -198,7 +276,7 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
 
     /// Operators (e.g. a monitoring bot) or the admin can stop everything at once.
     function pause() external {
-        if (!hasRole(OPERATOR_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+        if (msg.sender != ENTRY_POINT && !hasRole(OPERATOR_ROLE, msg.sender) && !hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
             revert AccessControlUnauthorizedAccount(msg.sender, OPERATOR_ROLE);
         }
         _pause();
@@ -221,6 +299,25 @@ contract RiftPayoutVault is AccessControlDefaultAdminRules, Pausable, Reentrancy
         if (perPayout > perDay) revert BadLimits();
         limits[token] = Limits({perPayout: perPayout, perDay: perDay});
         emit LimitsSet(token, perPayout, perDay);
+    }
+
+    /// Re-approve the gas paymaster up to `gasAllowance` for a listed token.
+    function refreshGasAllowance(address token) external onlyOperatorOrEntryPoint {
+        if (limits[token].perDay == 0) revert TokenNotAllowed(token);
+        _approveGas(token);
+    }
+
+    /// Admin switches the gas paymaster (zero address turns gasless off).
+    function setGasPaymaster(address paymaster, uint128 allowance) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (allowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(allowance);
+        gasPaymaster = paymaster;
+        gasAllowance = allowance;
+        emit GasPaymasterSet(paymaster, allowance);
+    }
+
+    function _approveGas(address token) internal {
+        if (gasPaymaster == address(0)) return;
+        IERC20(token).forceApprove(gasPaymaster, gasAllowance);
     }
 
     function setDelay(uint64 newDelay) external onlyRole(DEFAULT_ADMIN_ROLE) {
