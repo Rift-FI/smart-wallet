@@ -112,6 +112,9 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     mapping(uint256 day => uint256) public gasToppedUpOnDay;
     /// token => UTC day number => amount queued that day
     mapping(address token => mapping(uint256 day => uint256)) public queuedOnDay;
+    /// Every token ever listed (so a paymaster switch can revoke the old allowance everywhere).
+    address[] public listedTokens;
+    mapping(address token => bool) private isListed;
 
     event Paid(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount, address operator);
     event Skipped(bytes32 indexed ref, address indexed token, address indexed to, uint256 amount);
@@ -141,6 +144,7 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     error AllowanceTooHigh(uint128 allowance);
     error OverQueueDailyLimit(address token, uint256 wouldBe, uint256 cap);
     error GasBudgetExhausted(uint256 wouldBe, uint256 cap);
+    error BadGasConfig(uint128 allowance, uint128 perDay);
 
     constructor(
         address admin,
@@ -158,6 +162,7 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
         if (admin == address(0) || entryPoint == address(0)) revert ZeroAddress();
         if (paymasterAllowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(paymasterAllowance);
         if (paymasterPerDay > MAX_GAS_PER_DAY) revert AllowanceTooHigh(paymasterPerDay);
+        if (paymaster != address(0) && paymasterPerDay < paymasterAllowance) revert BadGasConfig(paymasterAllowance, paymasterPerDay);
         ENTRY_POINT = entryPoint;
         gasPaymaster = paymaster;
         gasAllowance = paymasterAllowance;
@@ -330,6 +335,10 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
         if (token == address(0)) revert ZeroAddress();
         if (perPayout > perDay) revert BadLimits();
         limits[token] = Limits({perPayout: perPayout, perDay: perDay, queuePerDay: queuePerDay});
+        if (!isListed[token]) {
+            isListed[token] = true;
+            listedTokens.push(token);
+        }
         emit LimitsSet(token, perPayout, perDay, queuePerDay);
     }
 
@@ -343,6 +352,14 @@ contract RiftPayoutVault is IAccount, AccessControlDefaultAdminRules, Pausable, 
     function setGasPaymaster(address paymaster, uint128 allowance, uint128 perDay) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (allowance > MAX_GAS_ALLOWANCE) revert AllowanceTooHigh(allowance);
         if (perDay > MAX_GAS_PER_DAY) revert AllowanceTooHigh(perDay);
+        if (paymaster != address(0) && perDay < allowance) revert BadGasConfig(allowance, perDay);
+        address old = gasPaymaster;
+        for (uint256 i; i < listedTokens.length; ++i) {
+            address t = listedTokens[i];
+            if (t.code.length == 0) continue; // listed for another chain
+            if (old != address(0) && old != paymaster) IERC20(t).forceApprove(old, 0);
+            if (paymaster != address(0)) IERC20(t).forceApprove(paymaster, allowance);
+        }
         gasPaymaster = paymaster;
         gasAllowance = allowance;
         gasPerDay = perDay;
